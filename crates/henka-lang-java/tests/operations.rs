@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use henka_core::operation::{Operation, OperationCtx, OperationOutcome, OperationRequest, Target};
 use henka_core::{EditApplier, Language, LanguageSession, Position, Project, Range};
-use henka_lang_java::operations::{ChangeSignatureOp, CodeActionOp, FindUsagesOp, RenameOp};
+use henka_lang_java::operations::{ChangeSignatureOp, CodeActionOp, FindUsagesOp, MoveOp, RenameOp};
 use henka_lang_java::{JdtlsInstall, JdtlsSession};
 use serde_json::json;
 
@@ -42,6 +42,42 @@ fn write_project(root: &Path) {
 /// Path to a source file within the project.
 fn src(name: &str) -> PathBuf {
     PathBuf::from(name)
+}
+
+/// Write Eclipse project metadata (`.project` + `.classpath` with a `src`
+/// source folder) so jdtls imports `root` as a real project instead of its
+/// flat-file "invisible project". Required for refactorings that relocate a
+/// file (move), whose resource edits jdtls only emits for a real project.
+fn write_eclipse_project(root: &Path) {
+    std::fs::write(
+        root.join(".project"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <projectDescription>\n\
+         \t<name>p</name>\n\
+         \t<comment></comment>\n\
+         \t<projects></projects>\n\
+         \t<buildSpec>\n\
+         \t\t<buildCommand>\n\
+         \t\t\t<name>org.eclipse.jdt.core.javabuilder</name>\n\
+         \t\t\t<arguments></arguments>\n\
+         \t\t</buildCommand>\n\
+         \t</buildSpec>\n\
+         \t<natures>\n\
+         \t\t<nature>org.eclipse.jdt.core.javanature</nature>\n\
+         \t</natures>\n\
+         </projectDescription>\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".classpath"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <classpath>\n\
+         \t<classpathentry kind=\"src\" path=\"src\"/>\n\
+         \t<classpathentry kind=\"con\" path=\"org.eclipse.jdt.launching.JRE_CONTAINER\"/>\n\
+         \t<classpathentry kind=\"output\" path=\"bin\"/>\n\
+         </classpath>\n",
+    )
+    .unwrap();
 }
 
 async fn session_for(root: &Path) -> Arc<dyn LanguageSession> {
@@ -399,5 +435,76 @@ async fn inline_method() {
     assert!(
         !after.contains("int g()"),
         "removed the inlined method: {after}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "launches a real jdtls JVM; run with --ignored"]
+async fn move_type_to_another_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Move relocates the file, which jdtls only expresses for a real project —
+    // not its flat-file "invisible project" — so give it Eclipse metadata with
+    // a `src` source folder. Package `a` holds Foo and a same-package referrer;
+    // package `b` is the (existing) destination.
+    write_eclipse_project(root);
+    std::fs::create_dir_all(root.join("src/a")).unwrap();
+    std::fs::create_dir_all(root.join("src/b")).unwrap();
+    std::fs::write(root.join("src/a/Foo.java"), "package a;\npublic class Foo {\n}\n").unwrap();
+    std::fs::write(
+        root.join("src/a/Bar.java"),
+        "package a;\npublic class Bar {\n    Foo f;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/b/Keep.java"), "package b;\nclass Keep {\n}\n").unwrap();
+
+    // Keep jdtls's data dir outside the project root (as in production); placing
+    // it under the root prevents the Eclipse import from associating the file
+    // with the real project, leaving move with nothing to relocate.
+    let install = JdtlsInstall::at(jdtls_home()).expect("a jdtls distribution under .cache/jdtls");
+    let data = tempfile::tempdir().unwrap();
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("jdtls-bundle/henka-jdtls-bundle.jar");
+    let session: Arc<dyn LanguageSession> = Arc::new(
+        JdtlsSession::start(&install, root, data.path(), &[bundle])
+            .await
+            .expect("jdtls should initialize"),
+    );
+    let project = project(root);
+    let ctx = OperationCtx {
+        project: &project,
+        session,
+    };
+
+    run_and_apply(
+        &MoveOp,
+        &ctx,
+        OperationRequest {
+            target: Target::File {
+                file: PathBuf::from("src/a/Foo.java"),
+            },
+            params: json!({ "to_package": "b" }),
+        },
+        root,
+    )
+    .await;
+
+    assert!(
+        !root.join("src/a/Foo.java").exists(),
+        "the source file was moved out of package a"
+    );
+    let moved = std::fs::read_to_string(root.join("src/b/Foo.java"))
+        .expect("Foo.java now lives in package b");
+    assert!(
+        moved.contains("package b;"),
+        "package declaration rewritten: {moved}"
+    );
+
+    // The same-package referrer now imports Foo from its new package.
+    let bar = std::fs::read_to_string(root.join("src/a/Bar.java")).unwrap();
+    assert!(
+        bar.contains("import b.Foo;"),
+        "reference updated to the new package: {bar}"
     );
 }

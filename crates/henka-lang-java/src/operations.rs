@@ -484,6 +484,134 @@ fn normalize_parameters(provided: &Value) -> Value {
     Value::Array(mapped)
 }
 
+/// Move a file's top-level type(s) to another package, updating references.
+///
+/// Backed by the delegate-command bundle: `getMoveDestinations` lists the
+/// packages the compilation unit can move to, then `move` computes the edit —
+/// which renames the file into the target package's directory and rewrites the
+/// `package` declaration and every reference.
+pub struct MoveOp;
+
+#[async_trait]
+impl Operation for MoveOp {
+    fn descriptor(&self) -> OperationDescriptor {
+        OperationDescriptor {
+            id: "move".into(),
+            title: "Move to package".into(),
+            description: "Move a file's top-level type(s) to another package, updating all \
+                          references"
+                .into(),
+            kind: OperationKind::Edit,
+            languages: vec![Language::Java],
+            target: TargetKind::File,
+            params_schema: json!({
+                "type": "object",
+                "properties": {
+                    "to_package": {
+                        "type": "string",
+                        "description": "Destination package as a dotted name (e.g. com.example.foo), \
+                                        or an empty string for the default package. Must be an \
+                                        existing package in the project."
+                    }
+                },
+                "required": ["to_package"]
+            }),
+        }
+    }
+
+    async fn run(
+        &self,
+        ctx: &OperationCtx<'_>,
+        req: &OperationRequest,
+    ) -> CoreResult<OperationOutcome> {
+        let session = jdtls(ctx)?;
+        let file = req
+            .target
+            .file()
+            .ok_or_else(|| CoreError::InvalidTarget("this operation expects a file".into()))?;
+        session.ensure_indexed().await.map_err(backend)?;
+        let uri = session.ensure_open(file).await.map_err(backend)?;
+
+        let to_package = req
+            .params
+            .get("to_package")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoreError::InvalidTarget("`to_package` is required".into()))?;
+
+        // Step 1: the packages this compilation unit can move to.
+        let move_params = json!({ "moveKind": "moveResource", "sourceUris": [uri] });
+        let response =
+            execute_command(session, "henka.mcp.getMoveDestinations", json!([move_params])).await?;
+        if let Some(err) = response.get("errorMessage").and_then(Value::as_str) {
+            return Err(CoreError::Backend(format!("move unavailable here: {err}")));
+        }
+        let destinations = response
+            .get("destinations")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        // Step 2: resolve the requested package to one of the offered destinations,
+        // passing the destination node back to `move` verbatim.
+        let chosen = destinations
+            .iter()
+            .find(|d| {
+                if to_package.is_empty() {
+                    d.get("isDefaultPackage")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                } else {
+                    d.get("displayName").and_then(Value::as_str) == Some(to_package)
+                }
+            })
+            .cloned()
+            .ok_or_else(|| {
+                let available: Vec<&str> = destinations
+                    .iter()
+                    .filter_map(|d| d.get("displayName").and_then(Value::as_str))
+                    .collect();
+                CoreError::InvalidTarget(format!(
+                    "no destination package `{to_package}` for this file; available: {}",
+                    if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                ))
+            })?;
+
+        // Step 3: compute the move edit.
+        let move_request = json!({
+            "moveKind": "moveResource",
+            "sourceUris": [uri],
+            "destination": chosen,
+            "updateReferences": true,
+        });
+        let result = execute_command(session, "henka.mcp.move", json!([move_request])).await?;
+        if let Some(err) = result.get("errorMessage").and_then(Value::as_str) {
+            return Err(CoreError::Backend(format!("move failed: {err}")));
+        }
+        let edit = result.get("edit").cloned().unwrap_or(Value::Null);
+        let edit = lsp::to_core_workspace_edit(edit).map_err(backend)?;
+
+        // A relocation must rename the file. If the edit carries no file
+        // operation, jdtls computed only reference updates and did not move the
+        // unit — which happens when the tree is not imported as a real project
+        // (loose files fall into jdtls's "invisible project"). Fail loudly
+        // rather than applying a misleading partial edit.
+        if edit.file_ops.is_empty() {
+            return Err(CoreError::Backend(
+                "move produced no file relocation: jdtls did not move the compilation unit. \
+                 This happens when the sources are not imported as a real project (e.g. loose \
+                 files in an invisible project, or moving within the same package). Move needs \
+                 a project jdtls can import (a Maven/Gradle build file or Eclipse metadata)."
+                    .into(),
+            ));
+        }
+        Ok(OperationOutcome::Edit(edit))
+    }
+}
+
 /// Find every reference to the symbol at a position.
 pub struct FindUsagesOp;
 
