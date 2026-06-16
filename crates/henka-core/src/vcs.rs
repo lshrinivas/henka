@@ -10,6 +10,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 /// The version-control system backing a project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Vcs {
@@ -184,6 +186,141 @@ pub fn working_copy_delta(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A changed file's content identity: its path (relative to the working copy
+/// root) and the git blob object id of its current contents, or `None` for the
+/// id when it could not be computed (git unavailable, or the path holds a
+/// character git's stdin protocol cannot express).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChangedFile {
+    /// The path, relative to the working copy root.
+    pub path: PathBuf,
+    /// The git blob object id of the file's current contents
+    /// (`git hash-object --no-filters`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oid: Option<String>,
+}
+
+/// A content fingerprint of the working-copy delta at `root` — the changed files
+/// (from [`working_copy_delta`]) with their content ids, plus a combined digest.
+///
+/// Each file carries its **git blob object id** (`git hash-object --no-filters`):
+/// a content-addressed hash the caller reproduces with the same native command,
+/// independent of git config (no autocrlf/gitattributes surprises) and even of a
+/// surrounding repository. The `digest` folds the whole manifest into one id
+/// (`git hash-object --stdin`) for a quick equality check. Both are
+/// *namespace-independent* — identical contents under different mount paths (e.g.
+/// `/workspaces/x` and `/root/x`) produce identical ids — so a caller can confirm
+/// the server reads the same tree, uncommitted edits included, without comparing
+/// paths. When git is unavailable, oids are omitted and `digest` falls back to a
+/// SHA-256 over the changed files' bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct WorkingCopyFingerprint {
+    /// The changed files with their content ids, sorted by path.
+    pub files: Vec<ChangedFile>,
+    /// A combined content id over `files`, or `None` for a clean tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+/// Compute the [`WorkingCopyFingerprint`] for the delta `changed` under `root`.
+pub fn working_copy_fingerprint(root: &Path, changed: &[PathBuf]) -> WorkingCopyFingerprint {
+    if changed.is_empty() {
+        return WorkingCopyFingerprint::default();
+    }
+    let mut paths: Vec<PathBuf> = changed.to_vec();
+    paths.sort();
+
+    // Prefer git's content-addressed blob ids: a native `git hash-object` the
+    // caller can reproduce. Fall back to a portable hash when git is absent.
+    if let Some(oids) = git_blob_oids(root, &paths) {
+        let files: Vec<ChangedFile> = paths
+            .iter()
+            .zip(oids)
+            .map(|(p, oid)| ChangedFile {
+                path: p.clone(),
+                oid: Some(oid),
+            })
+            .collect();
+        let manifest: String = files
+            .iter()
+            .map(|f| format!("{} {}\n", f.oid.as_deref().unwrap_or(""), f.path.display()))
+            .collect();
+        let digest = git_hash_stdin(root, manifest.as_bytes());
+        return WorkingCopyFingerprint { files, digest };
+    }
+
+    let files = paths
+        .iter()
+        .map(|p| ChangedFile {
+            path: p.clone(),
+            oid: None,
+        })
+        .collect();
+    WorkingCopyFingerprint {
+        files,
+        digest: raw_content_digest(root, &paths),
+    }
+}
+
+/// Git blob object ids for `paths` (relative to `root`), via a single
+/// `git hash-object --no-filters --stdin-paths`. `None` if git is unavailable,
+/// the batch fails, or a path cannot be expressed on git's newline-delimited
+/// stdin; a returned vec aligns one-to-one with `paths`.
+fn git_blob_oids(root: &Path, paths: &[PathBuf]) -> Option<Vec<String>> {
+    let mut input = String::new();
+    for p in paths {
+        let s = p.to_str()?;
+        if s.contains('\n') {
+            return None;
+        }
+        input.push_str(s);
+        input.push('\n');
+    }
+    let out = run_stdin(
+        root,
+        "git",
+        &["hash-object", "--no-filters", "--stdin-paths"],
+        input.as_bytes(),
+    )?;
+    let oids: Vec<String> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    (oids.len() == paths.len()).then_some(oids)
+}
+
+/// The git blob object id of `bytes` (`git hash-object --stdin`).
+fn git_hash_stdin(root: &Path, bytes: &[u8]) -> Option<String> {
+    run_stdin(root, "git", &["hash-object", "--stdin"], bytes)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// SHA-256 over the sorted changed files' paths and byte contents — the portable
+/// fallback when git is unavailable.
+fn raw_content_digest(root: &Path, paths: &[PathBuf]) -> Option<String> {
+    let mut hasher = Sha256::new();
+    for rel in paths {
+        let bytes = std::fs::read(root.join(rel)).ok()?;
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(&bytes);
+    }
+    Some(hex(&hasher.finalize()))
+}
+
+/// Lowercase-hex encode bytes.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// Parse `git status --porcelain -z` output. Entries are NUL-terminated; a
 /// rename entry is two NUL-separated fields (`old\0new`) and contributes its
 /// destination. The two-character status prefix and following space are
@@ -248,6 +385,29 @@ fn run(root: &Path, program: &str, args: &[&str]) -> Option<String> {
         .current_dir(root)
         .output()
         .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Like [`run`], but feeds `input` to the command's stdin. Used for git's
+/// `--stdin` / `--stdin-paths` protocols. The input is small (paths, a manifest),
+/// so writing it before draining stdout cannot deadlock.
+fn run_stdin(root: &Path, program: &str, args: &[&str], input: &[u8]) -> Option<String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(input).ok()?;
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -354,6 +514,45 @@ mod tests {
             got,
             vec![PathBuf::from("new.java"), PathBuf::from("other.java")]
         );
+    }
+
+    #[test]
+    fn fingerprint_is_empty_for_empty_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = working_copy_fingerprint(dir.path(), &[]);
+        assert!(fp.files.is_empty());
+        assert!(fp.digest.is_none());
+    }
+
+    #[test]
+    fn fingerprint_depends_only_on_content_not_root_path() {
+        // Two checkouts mounted at different paths (the /workspaces vs /root case)
+        // hold the same edit; their fingerprints must match so a caller can verify
+        // "same tree" without comparing paths.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let changed = [PathBuf::from("src/Foo.java")];
+        for root in [a.path(), b.path()] {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/Foo.java"), "class Foo {}\n").unwrap();
+        }
+        let fa = working_copy_fingerprint(a.path(), &changed);
+        let fb = working_copy_fingerprint(b.path(), &changed);
+        assert_eq!(
+            fa, fb,
+            "same content under different roots => same fingerprint"
+        );
+        assert!(fa.digest.is_some());
+        // The per-file id is git's blob object id, reproducible with
+        // `git hash-object` (when git is present, as it is in CI).
+        if let Some(oid) = &fa.files[0].oid {
+            let expected = git_hash_stdin(a.path(), b"class Foo {}\n").unwrap();
+            assert_eq!(oid, &expected, "per-file oid is the git blob id");
+        }
+
+        // A different edit yields a different fingerprint.
+        std::fs::write(b.path().join("src/Foo.java"), "class Foo { int x; }\n").unwrap();
+        assert_ne!(fa, working_copy_fingerprint(b.path(), &changed));
     }
 
     #[test]

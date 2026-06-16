@@ -45,6 +45,7 @@ schemars = "1"
 axum = "0.8"
 async-trait = "0.1"
 similar = { version = "3", features = ["text", "unicode"] }
+sha2 = "0.10"
 walkdir = "2"
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"

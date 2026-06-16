@@ -52,27 +52,39 @@ Operations are language-scoped and pluggable — do not assume a fixed menu.
 - A **file** target needs only `file` — e.g. organize imports.
 - A **project** target needs no location — e.g. a workspace-wide symbol search.
 
-Paths are relative to the project root unless absolute.
+**Prefer paths relative to the project root.** A relative `file` is resolved against
+the server's own root, so it works no matter how the server mounts the tree. Reach
+for an absolute path only to name a specific working copy (see below).
 
-**A mounted path is the same files — trust it.** When the server runs in a
-container, it reads your working copy through a bind mount, so the root it reports
-(e.g. `/workspaces/my-project`) and your host path name the **same tree on disk**,
-at the same revision. `register_project` tells you when it rewrote your path, and
-`project_status` reports the host path it corresponds to under `host_path`. A
-rewritten path is not a separate checkout — your `line`/`character` coordinates line
-up, so use them directly; no extra verification is needed.
+**Don't judge "same tree?" by the path.** The server resolves paths on its own
+filesystem and often runs in its own container, so it may see your checkout under a
+different path than you do — it reports `/workspaces/x` while you edit `/root/x`. A
+differing root does **not** mean a separate checkout: the two are frequently the same
+tree bind-mounted at two paths, so your coordinates still line up. Verify by **state,
+not path**:
 
-**A different working copy can drift — guard that case.** The one situation where
-the server's view can differ from yours is a genuinely separate working copy: a
-sibling git worktree / jj workspace sitting on another revision. There, a coordinate
-you computed against your copy can land on a different token. Two guards:
+- Call `project_status`. It reports the `revision`, the `changed_files` set — each
+  file with the git blob object id (`oid`) of its current contents — and a combined
+  `digest` over that set (uncommitted edits included).
+- Compare to your own checkout: `revision` against `jj log -r @` / `git rev-parse HEAD`;
+  each `changed_files[].path` against `jj diff --summary` / `git status`; and, for a
+  byte-exact check, each `oid` against `git hash-object --no-filters <file>` (git's own
+  content id, reproducible even outside a repository). The `digest` folds the whole set
+  into one id for an all-or-nothing check.
+- Match ⇒ the server sees exactly your tree, edits included; use your `line`/`character`
+  coordinates directly. Mismatch ⇒ it is a different working copy; use the guards below.
 
-- On a position or selection target, pass `expect` — the identifier (or exact
-  selected text) you expect there. The server verifies its own copy matches before
-  acting, failing loudly instead of silently mis-targeting.
-- `project_status` reports the revision and branch the server reads the project at,
-  so you can compare it against yours. Pass the matching `workspace` to direct an
-  edit at a specific working copy.
+**When the server's copy differs.** If the state does not match — a sibling worktree /
+jj workspace on another revision, or edits the server cannot see — a coordinate computed
+against your copy can land on a different token. Two guards:
+
+- On a position or selection target, pass `expect` — the identifier (or exact selected
+  text) you expect there. The server checks its own copy matches before acting, failing
+  loudly instead of silently mis-targeting.
+- Pass an explicit `workspace` (a path the server can reach) to direct the edit at that
+  working copy; the server overlays its uncommitted edits and writes the result back
+  there. Every edit response echoes the `workspace` and `revision` it acted on, so you
+  can confirm afterward.
 
 ## 4. Running an operation
 

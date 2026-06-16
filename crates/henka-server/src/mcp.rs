@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use henka_core::operation::{OperationCtx, OperationOutcome, OperationRequest};
 use henka_core::{
-    EditApplier, Error as CoreError, FileOperation, Language, OperationRegistry, Project,
-    ProjectRegistry, ProviderRegistry, Target, WorkspaceEdit, detect_revision, repo_identity,
-    working_copy_delta,
+    ChangedFile, EditApplier, Error as CoreError, FileOperation, Language, OperationRegistry,
+    Project, ProjectRegistry, ProviderRegistry, Target, WorkspaceEdit, detect_revision,
+    repo_identity, working_copy_delta, working_copy_fingerprint,
 };
 use rmcp::model::{
     Annotated, CallToolRequestParams, CallToolResult, Content, Implementation,
@@ -184,9 +184,13 @@ impl PathTranslation {
     fn mount(from: &Path, to: &Path) -> Self {
         let note = format!(
             "Henka reads this project at `{}`, the configured mount for your `{}`. \
-             It is the same tree on disk (a bind mount), not a separate checkout — \
-             coordinates and revisions you computed against your copy still apply. \
-             project_status reports the same path under `host_path`.",
+             When the mount is a bind of your checkout it is the same tree on disk, \
+             not a separate copy — coordinates you computed against your copy apply \
+             directly. Don't judge that by the path alone (mounts differ between \
+             containers): call project_status and confirm its `revision` and \
+             `digest` match your checkout (`digest` is reproducible from your \
+             changed files). If they differ, target edits with an explicit \
+             `workspace` or guard positions with `expect`.",
             to.display(),
             from.display(),
         );
@@ -236,18 +240,35 @@ struct VcsStatus {
     repo_root: Option<PathBuf>,
     /// Whether the working copy has uncommitted changes against its base.
     dirty: bool,
+    /// The files changed against the base (sorted), each with its git blob object
+    /// id. Lets a caller compare the server's dirty set — and each file's content
+    /// id — against its own (`jj diff --summary` / `git status`, then
+    /// `git hash-object`) without reasoning about mount paths.
+    changed_files: Vec<ChangedFile>,
+    /// A combined content digest over `changed_files` (see
+    /// [`WorkingCopyFingerprint`](henka_core::WorkingCopyFingerprint)), or `null`
+    /// for a clean tree. Reproducible in the caller's own checkout, it proves the
+    /// server sees the same uncommitted edits even under a different mount path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    digest: Option<String>,
 }
 
 /// Gather the project plus the VCS state of its root. Detecting the revision is
 /// read-only; the dirty check snapshots the working copy (jj's normal
 /// behavior), matching how operations already read the tree.
 fn project_status<'a>(project: &'a Project, path_map: &PathMap) -> ProjectStatus<'a> {
-    let vcs = detect_revision(&project.root).map(|rev| VcsStatus {
-        vcs: rev.vcs.to_string(),
-        revision: rev.id,
-        branch: rev.branch,
-        repo_root: repo_identity(&project.root).map(|id| id.path),
-        dirty: !working_copy_delta(&project.root).is_empty(),
+    let vcs = detect_revision(&project.root).map(|rev| {
+        let changed = working_copy_delta(&project.root);
+        let fingerprint = working_copy_fingerprint(&project.root, &changed);
+        VcsStatus {
+            vcs: rev.vcs.to_string(),
+            revision: rev.id,
+            branch: rev.branch,
+            repo_root: repo_identity(&project.root).map(|id| id.path),
+            dirty: !fingerprint.files.is_empty(),
+            changed_files: fingerprint.files,
+            digest: fingerprint.digest,
+        }
     });
     let host_path = path_map.reverse(&project.root);
     ProjectStatus {
@@ -285,8 +306,10 @@ impl HenkaMcp {
             Tool::new(
                 "project_status",
                 "Report a registered project's root, detected languages, and the version-control \
-                 state Henka reads it at (revision, branch, repo root, dirty). Use the VCS state to \
-                 confirm Henka's checkout matches the working copy you are editing before trusting \
+                 state Henka reads it at: revision, branch, repo root, dirty, the changed-file set, \
+                 and a content digest of the working copy. Compare `revision`/`digest`/`changed_files` \
+                 against your own checkout (not the path — the server may mount it elsewhere) to \
+                 confirm Henka sees the same tree, including uncommitted edits, before trusting \
                  position-targeted coordinates.",
                 schema::<ProjectIdParams>(),
             ),
@@ -469,9 +492,17 @@ impl HenkaMcp {
                     edit.retarget(root, &workspace);
                 }
                 reject_edits_outside(&edit, &workspace)?;
+                // Echo the working copy the edit was resolved against, and the
+                // revision it holds, so a caller can confirm the server acted on
+                // its own tree — even when the two see it under different mount
+                // paths — instead of inferring it from the registered root.
+                let acted_on = json!({
+                    "workspace": workspace,
+                    "revision": detect_revision(&workspace).map(|r| r.id),
+                });
                 if ops::dry_run(&args) {
                     let files = EditApplier::preview(&edit, &workspace).map_err(into_mcp)?;
-                    ok_json(&json!({ "dry_run": true, "files": files }))
+                    ok_json(&json!({ "dry_run": true, "workspace": acted_on, "files": files }))
                 } else {
                     let applied = EditApplier::apply(&edit, &workspace).map_err(into_mcp)?;
                     // When editing the session's own checkout, keep its view
@@ -479,7 +510,7 @@ impl HenkaMcp {
                     if on_base {
                         session.sync_changed(&applied.changed_files).await;
                     }
-                    ok_json(&json!({ "dry_run": false, "applied": applied }))
+                    ok_json(&json!({ "dry_run": false, "workspace": acted_on, "applied": applied }))
                 }
             }
         }
@@ -761,11 +792,14 @@ impl ServerHandler for HenkaMcp {
              projects; pass the project `id` on every operation. Call `list_projects` to find \
              one — working copies under the workspaces mount are auto-registered; otherwise \
              `register_project` a source tree (safe, persistent, non-destructive — just do it, \
-             don't ask). When the server runs in a container it reads your working copy through a \
-             bind mount, so a `/workspaces/...` root is the same files as your host path, not a \
-             separate checkout. Use `list_operations` to see what a project supports; edits \
-             default to a preview (a diff), pass `dry_run: false` to apply. Read the resource \
-             `skill://henka/refactoring` for the full workflow."
+             don't ask). Prefer paths relative to the project root — they work regardless of how \
+             the server mounts the tree. The server may see your checkout under a different path \
+             than you do (it often runs in its own container); don't treat a differing root as a \
+             separate checkout. To confirm it is your tree, call `project_status` and check its \
+             `revision` and `digest` match yours — not the path. If they differ, target an \
+             explicit `workspace` or guard positions with `expect`. Use `list_operations` to see \
+             what a project supports; edits default to a preview (a diff), pass `dry_run: false` \
+             to apply. Read the resource `skill://henka/refactoring` for the full workflow."
                 .into(),
         );
         info
@@ -1069,6 +1103,16 @@ mod tests {
             .unwrap();
         assert_ne!(preview.is_error, Some(true));
         assert_eq!(std::fs::read_to_string(&main).unwrap(), "hello\n");
+        // The response echoes the working copy it resolved the edit against, so a
+        // caller can confirm its own tree was the target regardless of the path.
+        let echoed = |res: &CallToolResult| -> Value {
+            let text = match &res.content[0].raw {
+                rmcp::model::RawContent::Text(t) => t.text.clone(),
+                _ => panic!("expected text content"),
+            };
+            serde_json::from_str::<Value>(&text).unwrap()["workspace"]["workspace"].clone()
+        };
+        assert_eq!(echoed(&preview).as_str(), root.to_str());
 
         // Apply.
         let applied = mcp
@@ -1080,6 +1124,7 @@ mod tests {
             .unwrap();
         assert_ne!(applied.is_error, Some(true));
         assert_eq!(std::fs::read_to_string(&main).unwrap(), "Xhello\n");
+        assert_eq!(echoed(&applied).as_str(), root.to_str());
     }
 
     #[tokio::test]
@@ -1231,10 +1276,44 @@ mod tests {
             vcs.get("revision").and_then(Value::as_str).is_some(),
             "revision reported: {value}"
         );
-        // A fresh commit with no further edits is clean.
+        // A fresh commit with no further edits is clean: no changed files, no digest.
         assert_eq!(vcs.get("dirty").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            vcs.get("changed_files").and_then(Value::as_array).map(Vec::len),
+            Some(0)
+        );
+        assert!(vcs.get("digest").is_none(), "clean tree has no digest: {value}");
         // The base project fields are still present (flattened).
         assert_eq!(value.get("id").and_then(Value::as_str), Some("p"));
+
+        // Now dirty the tree: status reports the changed file and a digest a
+        // caller can reproduce in its own checkout to confirm the same content.
+        std::fs::write(root.join("Main.java"), "changed\n").unwrap();
+        let res = mcp
+            .handle_call(call("project_status", args(json!({ "id": "p" }))))
+            .await
+            .unwrap();
+        let text = match &res.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let vcs = value.get("vcs").expect("vcs field present");
+        assert_eq!(vcs.get("dirty").and_then(Value::as_bool), Some(true));
+        let changed = vcs.get("changed_files").and_then(Value::as_array).unwrap();
+        let main = changed
+            .iter()
+            .find(|f| f["path"].as_str() == Some("Main.java"))
+            .unwrap_or_else(|| panic!("changed_files lists the edit: {value}"));
+        // Each changed file carries its git blob object id (git is present in CI).
+        assert!(
+            main["oid"].as_str().is_some(),
+            "changed file reports a git blob oid: {value}"
+        );
+        assert!(
+            vcs.get("digest").and_then(Value::as_str).is_some(),
+            "dirty tree reports a digest: {value}"
+        );
     }
 
     #[tokio::test]

@@ -37,6 +37,15 @@ the `/workspaces` mount, appending any extra rewrites you set in `HENKA_PATH_MAP
 Running the image directly, set it yourself, e.g.
 `-e HENKA_PATH_MAP=/home/me/src=/workspaces`.
 
+When the client is itself containerized, the `host` side of a rewrite is the
+client container's mount path, not the underlying host's — e.g. a client that
+sees the tree at `/root/src` wants `HENKA_PATH_MAP=/root/src=/workspaces`. A client
+that cannot be path-mapped need not reason about paths at all: `project_status`
+reports the `revision` and the changed-file set with each file's git blob object
+id (plus a combined `digest`), which the client reproduces in its own checkout
+with `git hash-object` to confirm Henka reads the same tree — the same edit at a
+different mount path yields the same ids.
+
 Configuration knobs (environment variables, all optional):
 
 | Variable | Default | Purpose |
