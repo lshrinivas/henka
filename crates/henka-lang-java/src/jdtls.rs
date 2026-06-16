@@ -289,14 +289,20 @@ async fn initialize(client: &LspClient, root: &Path, bundles: &[String]) -> Resu
     if !bundles.is_empty() {
         init_options["bundles"] = json!(bundles);
     }
+    let root_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".into());
     let params = json!({
         "processId": std::process::id(),
         "rootUri": root_uri,
+        "workspaceFolders": [{ "uri": root_uri, "name": root_name }],
         "capabilities": {
             "workspace": {
                 "applyEdit": true,
                 "workspaceEdit": { "documentChanges": true, "resourceOperations": ["create", "rename", "delete"] },
                 "configuration": true,
+                "workspaceFolders": true,
                 "executeCommand": { "dynamicRegistration": true },
                 "symbol": { "dynamicRegistration": true },
             },
