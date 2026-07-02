@@ -367,11 +367,14 @@ fn parse_jj_diff_summary(text: &str) -> Vec<PathBuf> {
 /// default workspace this is a directory; for a secondary workspace it is a
 /// file whose contents point at the main repo's `.jj/repo`.
 fn jj_repo_dir(root: &Path) -> Option<PathBuf> {
-    let repo = root.join(".jj").join("repo");
+    let jj_dir = root.join(".jj");
+    let repo = jj_dir.join("repo");
     let resolved = if repo.is_file() {
-        // A secondary workspace: the file holds the path to the real repo dir.
+        // A secondary workspace: the file holds the path to the real repo dir,
+        // expressed relative to the `.jj/` directory. Resolve it there so the
+        // result is correct regardless of the process's working directory.
         let target = std::fs::read_to_string(&repo).ok()?;
-        PathBuf::from(target.trim())
+        jj_dir.join(target.trim())
     } else {
         repo
     };
@@ -441,6 +444,57 @@ mod tests {
     fn repo_identity_none_without_vcs() {
         let dir = tempfile::tempdir().unwrap();
         assert!(repo_identity(dir.path()).is_none());
+    }
+
+    /// Lay out a default workspace at `main` and a secondary workspace at
+    /// `ws`, the way `jj workspace add` does: the secondary's `.jj/repo` is a
+    /// file holding the path to the default workspace's repo directory,
+    /// relative to the secondary's own `.jj/`.
+    fn jj_workspace_pair(base: &Path) -> (PathBuf, PathBuf) {
+        let main = base.join("main");
+        let repo = main.join(".jj/repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let ws = base.join("ws");
+        std::fs::create_dir_all(ws.join(".jj")).unwrap();
+        std::fs::write(ws.join(".jj/repo"), "../../main/.jj/repo").unwrap();
+
+        (main, ws)
+    }
+
+    #[test]
+    fn jj_repo_dir_resolves_secondary_workspace_pointer() {
+        // The pointer is relative to the workspace's `.jj/`, not to the
+        // process working directory — resolving it anywhere else names a path
+        // that does not exist, and the caller sees `None`.
+        let dir = tempfile::tempdir().unwrap();
+        let (main, ws) = jj_workspace_pair(dir.path());
+
+        let expected = main.join(".jj/repo").canonicalize().unwrap();
+        assert_eq!(jj_repo_dir(&ws), Some(expected));
+    }
+
+    #[test]
+    fn jj_repo_dir_uses_the_directory_for_the_default_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, _) = jj_workspace_pair(dir.path());
+
+        let expected = main.join(".jj/repo").canonicalize().unwrap();
+        assert_eq!(jj_repo_dir(&main), Some(expected));
+    }
+
+    #[test]
+    fn jj_workspaces_of_one_repo_share_a_repo_identity() {
+        // What `ensure_same_repo` relies on: a secondary workspace must report
+        // the same repo as the default one, or every operation naming it as
+        // its `workspace` is rejected as a different repository.
+        let dir = tempfile::tempdir().unwrap();
+        let (main, ws) = jj_workspace_pair(dir.path());
+
+        let main_id = repo_identity(&main).expect("default workspace has an identity");
+        let ws_id = repo_identity(&ws).expect("secondary workspace has an identity");
+        assert_eq!(main_id.vcs, Vcs::Jj);
+        assert_eq!(main_id, ws_id);
     }
 
     #[test]
