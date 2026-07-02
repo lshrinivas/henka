@@ -62,6 +62,7 @@ impl Operation for RenameOp {
                 },
                 "required": ["new_name"],
             }),
+            code_action_kind: None,
         }
     }
 
@@ -123,6 +124,7 @@ impl Operation for FindUsagesOp {
                     }
                 }
             }),
+            code_action_kind: None,
         }
     }
 
@@ -240,6 +242,7 @@ impl Operation for CodeActionOp {
             languages: languages(),
             target: self.target,
             params_schema: json!({ "type": "object", "properties": {} }),
+            code_action_kind: Some(self.action_kind.into()),
         }
     }
 

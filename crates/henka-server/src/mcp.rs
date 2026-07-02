@@ -964,6 +964,7 @@ mod tests {
                     "properties": { "text": { "type": "string" } },
                     "required": ["text"],
                 }),
+                code_action_kind: None,
             }
         }
 
@@ -1010,6 +1011,7 @@ mod tests {
                 languages: vec![Language::Java],
                 target: TargetKind::Position,
                 params_schema: json!({ "type": "object", "properties": {} }),
+                code_action_kind: None,
             }
         }
 

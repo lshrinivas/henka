@@ -58,6 +58,7 @@ impl Operation for RenameOp {
                 },
                 "required": ["new_name"],
             }),
+            code_action_kind: None,
         }
     }
 
@@ -227,6 +228,7 @@ impl Operation for CodeActionOp {
             languages: vec![Language::Java],
             target: self.target,
             params_schema: json!({ "type": "object", "properties": {} }),
+            code_action_kind: Some(self.action_kind.into()),
         }
     }
 
@@ -376,6 +378,7 @@ impl Operation for ChangeSignatureOp {
                     }
                 }
             }),
+            code_action_kind: None,
         }
     }
 
@@ -516,6 +519,7 @@ impl Operation for MoveOp {
                 },
                 "required": ["to_package"]
             }),
+            code_action_kind: None,
         }
     }
 
@@ -635,6 +639,7 @@ impl Operation for FindUsagesOp {
                     }
                 }
             }),
+            code_action_kind: None,
         }
     }
 
