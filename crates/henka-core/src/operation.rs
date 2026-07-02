@@ -101,6 +101,12 @@ pub struct OperationDescriptor {
     /// JSON Schema (an object schema) for the operation-specific parameters,
     /// beyond the common target/`dry_run` envelope.
     pub params_schema: Value,
+    /// LSP `CodeActionKind` (e.g. `refactor.extract.variable`,
+    /// `source.organizeImports`) when this operation corresponds to a
+    /// standard code-action refactoring. `None` for operations without
+    /// an LSP-standard shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_action_kind: Option<String>,
 }
 
 impl OperationDescriptor {

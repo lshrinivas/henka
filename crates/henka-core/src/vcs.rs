@@ -367,11 +367,14 @@ fn parse_jj_diff_summary(text: &str) -> Vec<PathBuf> {
 /// default workspace this is a directory; for a secondary workspace it is a
 /// file whose contents point at the main repo's `.jj/repo`.
 fn jj_repo_dir(root: &Path) -> Option<PathBuf> {
-    let repo = root.join(".jj").join("repo");
+    let jj_dir = root.join(".jj");
+    let repo = jj_dir.join("repo");
     let resolved = if repo.is_file() {
-        // A secondary workspace: the file holds the path to the real repo dir.
+        // A secondary workspace: the file holds the path to the real repo dir,
+        // expressed relative to the `.jj/` directory. Resolve it there so the
+        // result is correct regardless of the process's working directory.
         let target = std::fs::read_to_string(&repo).ok()?;
-        PathBuf::from(target.trim())
+        jj_dir.join(target.trim())
     } else {
         repo
     };
