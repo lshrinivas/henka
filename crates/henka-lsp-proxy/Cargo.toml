@@ -1,0 +1,30 @@
+[package]
+name = "henka-lsp-proxy"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "henka-lsp-proxy"
+path = "src/main.rs"
+
+[dependencies]
+henka-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+] }
+tower-lsp-server = "0.22"
+url = "2"
+percent-encoding = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
