@@ -354,6 +354,61 @@ impl LanguageServer for Backend {
             ..params
         })
     }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> LspResult<Option<serde_json::Value>> {
+        let session = self.session();
+        let op_id = params.command.strip_prefix("henka.").ok_or_else(|| {
+            LspError::invalid_params(format!(
+                "unknown command `{}` (expected henka.<op-id>)",
+                params.command
+            ))
+        })?;
+        if !EXEC_COMMAND_OPS.contains(&op_id) {
+            return Err(LspError::invalid_params(format!(
+                "command `{}` is not exposed via executeCommand",
+                params.command
+            )));
+        }
+        // The client sends a single JSON object matching henka's per-op
+        // parameter schema (per plan §5). Anything else is a protocol misuse.
+        let mut args = match params.arguments.into_iter().next() {
+            Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+            Some(_) => {
+                return Err(LspError::invalid_params(
+                    "executeCommand arguments[0] must be a JSON object",
+                ));
+            }
+            None => serde_json::Value::Object(Default::default()),
+        };
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("dry_run".into(), serde_json::Value::Bool(true));
+        }
+
+        let response = session
+            .mcp
+            .call_tool(op_id, session.call_args(args))
+            .await
+            .map_err(mcp_to_lsp)?;
+        let edit_value = response.get("edit").ok_or_else(|| LspError {
+            code: tower_lsp_server::jsonrpc::ErrorCode::InternalError,
+            message: format!("`{op_id}` dry_run response missing `edit` field")
+                .into(),
+            data: None,
+        })?;
+        let workspace_edit =
+            henka_edit_to_workspace_edit(edit_value, &session.info.workspace_path)
+                .map_err(mcp_to_lsp)?;
+        Ok(Some(serde_json::to_value(workspace_edit).map_err(|e| {
+            LspError {
+                code: tower_lsp_server::jsonrpc::ErrorCode::InternalError,
+                message: e.to_string().into(),
+                data: None,
+            }
+        })?))
+    }
 }
 
 /// Does the client's requested `only` kind match (as a prefix) the op's kind?
