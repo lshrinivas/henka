@@ -10,4 +10,5 @@
 //! mapping itself.
 
 pub mod config;
+pub mod mcp;
 pub mod project;
