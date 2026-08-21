@@ -399,9 +399,10 @@ impl HenkaMcp {
         }
     }
 
-    /// Run a catalog operation: resolve the project, choose the language(s) that
-    /// will serve the request, run the operation on each, and either return the
-    /// query result or preview/apply the edit.
+    /// Run a catalog operation from MCP call arguments: resolve the project,
+    /// look up the operation's descriptor to parse the target and parameters
+    /// out of the call envelope, and hand off to the shared
+    /// [`run`](Self::run) core.
     async fn dispatch_operation(
         &self,
         name: &str,
@@ -415,23 +416,73 @@ impl HenkaMcp {
             reg.get(&project_id).map_err(into_mcp)?.clone()
         };
 
-        // The project's languages that contribute an operation under this id.
-        let candidates = self.operations.languages_for(name, &project.languages);
-        let Some(&any) = candidates.first() else {
-            return Err(McpError::invalid_params(
-                format!("unknown tool or operation `{name}` for project `{project_id}`"),
-                None,
-            ));
-        };
-        // Every registration under one id declares the same target shape and
-        // reads the same parameters, so any one of them describes the request;
-        // the operation that runs it is resolved per language below.
-        let described_by = self.operations.resolve(name, any).map_err(into_mcp)?;
+        let descriptor = self
+            .descriptor_for(name, &project.languages)
+            .map_err(|_| {
+                McpError::invalid_params(
+                    format!("unknown tool or operation `{name}` for project `{project_id}`"),
+                    None,
+                )
+            })?;
+
+        let target = ops::parse_target(&args, descriptor.target)?;
+        let params = ops::operation_params(&args);
+        let workspace = ops::workspace(&args);
+        let expect = ops::expect(&args);
+        let dry_run = ops::dry_run(&args);
+
+        let result = self
+            .run(&project, name, target, params, workspace, expect, dry_run)
+            .await
+            .map_err(into_mcp)?;
+        match result {
+            DispatchResult::Query(value) | DispatchResult::Edit(value) => ok_json(&value),
+        }
+    }
+
+    /// The descriptor for operation `id`, consulting whichever of `languages`
+    /// registers it first. Every registration under one id declares the same
+    /// target shape and parameters, so any one of them describes the request;
+    /// which language actually runs it is resolved per language inside
+    /// [`run`](Self::run).
+    pub(crate) fn descriptor_for(
+        &self,
+        id: &str,
+        languages: &[Language],
+    ) -> Result<OperationDescriptor, CoreError> {
+        let candidates = self.operations.languages_for(id, languages);
+        let any = candidates
+            .first()
+            .copied()
+            .ok_or_else(|| CoreError::OperationNotAvailable(id.to_string()))?;
+        Ok(self.operations.resolve(id, any)?.descriptor())
+    }
+
+    /// Execute a catalog operation against a project, independent of the
+    /// access surface the request arrived on: resolve the language(s) that
+    /// serve `id`, run it on each — fanning a project-scoped query out across
+    /// every applicable language and merging the results; an edit resolves to
+    /// exactly one, so the first edit outcome wins — and shape the outcome
+    /// into a [`DispatchResult`].
+    pub(crate) async fn run(
+        &self,
+        project: &Project,
+        id: &str,
+        mut target: Target,
+        params: Value,
+        workspace_override: Option<PathBuf>,
+        expect: Option<String>,
+        dry_run: bool,
+    ) -> Result<DispatchResult, CoreError> {
+        let candidates = self.operations.languages_for(id, &project.languages);
+        let any = candidates
+            .first()
+            .copied()
+            .ok_or_else(|| CoreError::OperationNotAvailable(id.to_string()))?;
+        let described_by = self.operations.resolve(id, any)?;
         let descriptor = described_by.descriptor();
 
-        let mut target = ops::parse_target(&args, descriptor.target)?;
         remap_target_file(&self.path_map, &mut target);
-        let params = ops::operation_params(&args);
         let languages = dispatch_languages(
             &candidates,
             &self.providers,
@@ -441,17 +492,17 @@ impl HenkaMcp {
         )?;
 
         // Resolve and validate the working copy the edits should land in.
-        let workspace = resolve_workspace(&args, &target, &project, &self.path_map);
+        let workspace = resolve_workspace(workspace_override, &target, project, &self.path_map);
         ensure_same_repo(&workspace, &project.root)?;
 
         // If the caller supplied an `expect` guard, verify the coordinate
         // resolves to the intended symbol in Henka's own copy before acting,
         // turning a silent mis-target into an actionable error.
-        validate_expectation(&args, &target, &workspace)?;
+        validate_expectation(expect.as_deref(), &target, &workspace)?;
 
         // Only a read-only, project-scoped query is served by several
-        // languages; an edit resolves to exactly one, so the first edit outcome
-        // is the only one.
+        // languages; an edit resolves to exactly one, so the first edit
+        // outcome is the only one.
         let mut queries = Vec::with_capacity(languages.len());
         let mut asked: Vec<Arc<dyn LanguageProvider>> = Vec::new();
         for language in languages {
@@ -465,9 +516,9 @@ impl HenkaMcp {
             }
             asked.push(Arc::clone(&provider));
 
-            let operation = self.operations.resolve(name, language).map_err(into_mcp)?;
+            let operation = self.operations.resolve(id, language)?;
             let (session, guard, outcome) = self
-                .run_operation(operation, &provider, &project, &target, &params, &workspace)
+                .run_operation(operation, &provider, project, &target, &params, &workspace)
                 .await?;
             match outcome {
                 OperationOutcome::Query(value) => queries.push(value),
@@ -476,21 +527,21 @@ impl HenkaMcp {
                     // the index sync that follows it, so a concurrent request
                     // can't reach the session while the coordinates it would
                     // resolve against are still changing.
-                    let finished = self.finish_edit(edit, &session, &args, &workspace).await;
+                    let finished = self.finish_edit(edit, &session, dry_run, &workspace).await;
                     drop(guard);
                     return finished;
                 }
             }
         }
         let limit = ops::result_limit(&params, &descriptor.params_schema);
-        ok_json(&ops::merge_query_results(queries, limit))
+        Ok(DispatchResult::Query(ops::merge_query_results(queries, limit)))
     }
 
     /// The provider registered for `language`.
-    fn provider_for(&self, language: Language) -> Result<Arc<dyn LanguageProvider>, McpError> {
-        self.providers.get(language).ok_or_else(|| {
-            McpError::internal_error(format!("no provider registered for `{language}`"), None)
-        })
+    fn provider_for(&self, language: Language) -> Result<Arc<dyn LanguageProvider>, CoreError> {
+        self.providers
+            .get(language)
+            .ok_or_else(|| CoreError::Backend(format!("no provider registered for `{language}`")))
     }
 
     /// Run `operation` on the session `provider` holds for `project`, with
@@ -504,8 +555,8 @@ impl HenkaMcp {
         target: &Target,
         params: &Value,
         workspace: &Path,
-    ) -> Result<(Arc<dyn LanguageSession>, RequestGuard, OperationOutcome), McpError> {
-        let session = provider.session(project).await.map_err(into_mcp)?;
+    ) -> Result<(Arc<dyn LanguageSession>, RequestGuard, OperationOutcome), CoreError> {
+        let session = provider.session(project).await?;
         // Serialize the request and overlay the working copy's content onto the
         // shared index, so the operation sees that working copy. The overlay is
         // restored before returning; the guard travels back to the caller, which
@@ -514,10 +565,7 @@ impl HenkaMcp {
         let on_base = session.root() == Some(workspace);
         if !on_base {
             let delta = working_copy_delta(workspace);
-            session
-                .overlay_workspace(workspace, &delta)
-                .await
-                .map_err(into_mcp)?;
+            session.overlay_workspace(workspace, &delta).await?;
         }
 
         let ctx = OperationCtx {
@@ -532,7 +580,7 @@ impl HenkaMcp {
 
         // Always restore the base index view, even if the operation failed.
         session.restore_overlay().await;
-        Ok((session, guard, outcome.map_err(into_mcp)?))
+        Ok((session, guard, outcome?))
     }
 
     /// Preview or apply an edit an operation produced, reporting the working
@@ -541,9 +589,9 @@ impl HenkaMcp {
         &self,
         mut edit: WorkspaceEdit,
         session: &Arc<dyn LanguageSession>,
-        args: &JsonObject,
+        dry_run: bool,
         workspace: &Path,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<DispatchResult, CoreError> {
         // Retarget the edit (computed against the session's checkout) onto the
         // requested working copy, then refuse to escape it.
         if let Some(root) = session.root() {
@@ -558,17 +606,21 @@ impl HenkaMcp {
             "workspace": workspace,
             "revision": detect_revision(workspace).map(|r| r.id),
         });
-        if ops::dry_run(args) {
-            let files = EditApplier::preview(&edit, workspace).map_err(into_mcp)?;
-            ok_json(&json!({ "dry_run": true, "workspace": acted_on, "files": files }))
+        if dry_run {
+            let files = EditApplier::preview(&edit, workspace)?;
+            Ok(DispatchResult::Edit(
+                json!({ "dry_run": true, "workspace": acted_on, "files": files }),
+            ))
         } else {
-            let applied = EditApplier::apply(&edit, workspace).map_err(into_mcp)?;
+            let applied = EditApplier::apply(&edit, workspace)?;
             // When editing the session's own checkout, keep its view current so
             // later operations see the applied changes.
             if session.root() == Some(workspace) {
                 session.sync_changed(&applied.changed_files).await;
             }
-            ok_json(&json!({ "dry_run": false, "workspace": acted_on, "applied": applied }))
+            Ok(DispatchResult::Edit(
+                json!({ "dry_run": false, "workspace": acted_on, "applied": applied }),
+            ))
         }
     }
 }
@@ -590,31 +642,25 @@ fn dispatch_languages(
     descriptor: &OperationDescriptor,
     target: &Target,
     route: LanguageRoute,
-) -> Result<Vec<Language>, McpError> {
+) -> Result<Vec<Language>, CoreError> {
     let named = target
         .file()
         .and_then(|file| Language::from_path(file))
         .or_else(|| route.language());
     if let Some(language) = named {
         let Some(candidate) = serving_candidate(candidates, providers, language) else {
-            return Err(McpError::invalid_params(
-                format!(
-                    "`{}` is not served for `{language}` in this project",
-                    descriptor.id
-                ),
-                None,
-            ));
+            return Err(CoreError::InvalidTarget(format!(
+                "`{}` is not served for `{language}` in this project",
+                descriptor.id
+            )));
         };
         return Ok(vec![candidate]);
     }
     if let LanguageRoute::Unplaceable(handle) = route {
-        return Err(McpError::invalid_params(
-            format!(
-                "cannot tell which language `{handle}` belongs to, so `{}` has nowhere to run;                  pass a handle this project's servers issued",
-                descriptor.id
-            ),
-            None,
-        ));
+        return Err(CoreError::InvalidTarget(format!(
+            "cannot tell which language `{handle}` belongs to, so `{}` has nowhere to run;                  pass a handle this project's servers issued",
+            descriptor.id
+        )));
     }
     if descriptor.target == TargetKind::Project && descriptor.kind == OperationKind::Query {
         return Ok(candidates.to_vec());
@@ -644,16 +690,27 @@ fn serving_candidate(
     })
 }
 
+/// The transport-neutral result of running one catalog operation, so every
+/// access surface can shape it into its own response.
+pub(crate) enum DispatchResult {
+    /// A read-only query's structured result.
+    Query(Value),
+    /// An edit that was previewed or applied, as its response object (carrying
+    /// `dry_run`, the `workspace` acted on, and either `files` or `applied`).
+    Edit(Value),
+}
+
 /// Resolve the working copy a request's edits should be applied to: an explicit
-/// `workspace`, else the working copy containing an absolute target `file`, else
-/// the project root. Caller-supplied paths are translated through `map`.
+/// `workspace_override`, else the working copy containing an absolute target
+/// `file`, else the project root. Caller-supplied paths are translated through
+/// `map`.
 fn resolve_workspace(
-    args: &JsonObject,
+    workspace_override: Option<PathBuf>,
     target: &Target,
     project: &Project,
     map: &PathMap,
 ) -> PathBuf {
-    if let Some(ws) = ops::workspace(args) {
+    if let Some(ws) = workspace_override {
         return map.map(&ws);
     }
     if let Some(file) = target.file()
@@ -746,7 +803,7 @@ fn working_copy_root_containing(file: &Path) -> Option<PathBuf> {
 
 /// Validate that `workspace` is a working copy of the same repository as
 /// `project_root` (or, with no VCS, is the project root itself).
-fn ensure_same_repo(workspace: &Path, project_root: &Path) -> Result<(), McpError> {
+fn ensure_same_repo(workspace: &Path, project_root: &Path) -> Result<(), CoreError> {
     let same = match (repo_identity(workspace), repo_identity(project_root)) {
         (Some(a), Some(b)) => a == b,
         (None, None) => canonical(workspace) == canonical(project_root),
@@ -755,13 +812,10 @@ fn ensure_same_repo(workspace: &Path, project_root: &Path) -> Result<(), McpErro
     if same {
         Ok(())
     } else {
-        Err(McpError::invalid_params(
-            format!(
-                "workspace `{}` is not a working copy of the project",
-                workspace.display()
-            ),
-            None,
-        ))
+        Err(CoreError::InvalidTarget(format!(
+            "workspace `{}` is not a working copy of the project",
+            workspace.display()
+        )))
     }
 }
 
@@ -779,11 +833,11 @@ fn canonical(p: &Path) -> PathBuf {
 /// and otherwise produce a confident, wrong result. With no `expect`, behavior
 /// is unchanged.
 fn validate_expectation(
-    args: &JsonObject,
+    expected: Option<&str>,
     target: &Target,
     workspace: &Path,
-) -> Result<(), McpError> {
-    let Some(expected) = ops::expect(args) else {
+) -> Result<(), CoreError> {
+    let Some(expected) = expected else {
         return Ok(());
     };
     // UTF-16 coordinates, matching the schema and the LSP backends.
@@ -809,7 +863,7 @@ fn validate_expectation(
         Target::File { .. } | Target::Project => return Ok(()),
     };
 
-    if found.as_deref() == Some(expected.as_str()) {
+    if found.as_deref() == Some(expected) {
         return Ok(());
     }
 
@@ -825,36 +879,30 @@ fn validate_expectation(
         }
         None => String::new(),
     };
-    Err(McpError::invalid_params(
-        format!(
-            "target validation failed: expected {what} `{expected}` at {}{at}, but Henka's copy \
-             has {saw} there. Henka is reading `{}`{here}. The coordinate may have been computed \
-             against a different revision or checkout — call project_status to compare, or pass \
-             the matching `workspace`.",
-            file.display(),
-            workspace.display(),
-        ),
-        None,
-    ))
+    Err(CoreError::InvalidTarget(format!(
+        "target validation failed: expected {what} `{expected}` at {}{at}, but Henka's copy \
+         has {saw} there. Henka is reading `{}`{here}. The coordinate may have been computed \
+         against a different revision or checkout — call project_status to compare, or pass \
+         the matching `workspace`.",
+        file.display(),
+        workspace.display(),
+    )))
 }
 
 /// Read the target file as Henka sees it in `workspace`, for validation. A
 /// missing file is itself surfaced (it usually means the path doesn't resolve
 /// the way the caller expects).
-fn read_for_validation(workspace: &Path, file: &Path) -> Result<String, McpError> {
+fn read_for_validation(workspace: &Path, file: &Path) -> Result<String, CoreError> {
     let abs = if file.is_absolute() {
         file.to_path_buf()
     } else {
         workspace.join(file)
     };
     std::fs::read_to_string(&abs).map_err(|e| {
-        McpError::invalid_params(
-            format!(
-                "cannot read `{}` to validate the target: {e}",
-                abs.display()
-            ),
-            None,
-        )
+        CoreError::InvalidTarget(format!(
+            "cannot read `{}` to validate the target: {e}",
+            abs.display()
+        ))
     })
 }
 
@@ -874,7 +922,7 @@ fn position_label(target: &Target) -> String {
 
 /// Reject an edit that, after retargeting, would write to an absolute path
 /// outside `workspace` (e.g. a backend emitting edits to dependency sources).
-fn reject_edits_outside(edit: &WorkspaceEdit, workspace: &Path) -> Result<(), McpError> {
+fn reject_edits_outside(edit: &WorkspaceEdit, workspace: &Path) -> Result<(), CoreError> {
     let inside = |p: &Path| !p.is_absolute() || p.starts_with(workspace);
     let ok = edit.files.iter().all(|f| inside(&f.path))
         && edit.file_ops.iter().all(|op| match op {
@@ -884,9 +932,8 @@ fn reject_edits_outside(edit: &WorkspaceEdit, workspace: &Path) -> Result<(), Mc
     if ok {
         Ok(())
     } else {
-        Err(McpError::invalid_params(
-            "refactoring would edit files outside the workspace",
-            None,
+        Err(CoreError::InvalidTarget(
+            "refactoring would edit files outside the workspace".to_string(),
         ))
     }
 }
@@ -1067,8 +1114,8 @@ mod tests {
         OperationRequest, Target, TargetKind,
     };
     use henka_core::{
-        FileEdit, Language, LanguageProvider, LanguageSession, PositionEncoding, Range, Result,
-        TextEdit, WorkspaceEdit,
+        FileEdit, Language, LanguageProvider, LanguageSession, Position, PositionEncoding, Range,
+        Result, TextEdit, WorkspaceEdit,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1767,6 +1814,61 @@ mod tests {
             text.contains("svc-x"),
             "expected auto-registered project in listing, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_executes_a_query_directly() {
+        // The shared core runs from an operation id, with no MCP call
+        // envelope — the path every non-MCP surface takes.
+        let dir = tempfile::tempdir().unwrap();
+        let (mcp, _) = handler_with_project(dir.path());
+        let project = mcp.registry.read().await.get("p").unwrap().clone();
+        let target = Target::Position {
+            file: "Main.java".into(),
+            position: Position::new(3, 0),
+        };
+        let result = mcp
+            .run(&project, "echo", target, json!({}), None, None, true)
+            .await
+            .unwrap();
+        match result {
+            DispatchResult::Query(value) => assert_eq!(value["line"], json!(3)),
+            DispatchResult::Edit(_) => panic!("expected a query result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_previews_then_applies_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mcp, root) = handler_with_project(dir.path());
+        let main = root.join("Main.java");
+        let project = mcp.registry.read().await.get("p").unwrap().clone();
+        let target = || Target::Position {
+            file: "Main.java".into(),
+            position: Position::new(0, 0),
+        };
+
+        // Preview (dry_run) computes the edit without touching the file.
+        let preview = mcp
+            .run(&project, "insert-text", target(), json!({ "text": "X" }), None, None, true)
+            .await
+            .unwrap();
+        match preview {
+            DispatchResult::Edit(value) => assert_eq!(value["dry_run"], json!(true)),
+            DispatchResult::Query(_) => panic!("expected an edit result"),
+        }
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), "hello\n");
+
+        // Applying writes it.
+        let applied = mcp
+            .run(&project, "insert-text", target(), json!({ "text": "X" }), None, None, false)
+            .await
+            .unwrap();
+        match applied {
+            DispatchResult::Edit(value) => assert_eq!(value["dry_run"], json!(false)),
+            DispatchResult::Query(_) => panic!("expected an edit result"),
+        }
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), "Xhello\n");
     }
 
     #[tokio::test]
