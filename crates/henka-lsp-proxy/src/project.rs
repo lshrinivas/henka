@@ -7,7 +7,43 @@
 //! Henka's own `derive_id`, but a project may have been registered under an
 //! explicit id that has nothing to do with its directory name.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// One entry of Henka's `list_projects` response — the fields needed to tell
+/// which registered project is the workspace the client opened.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RegisteredProject {
+    pub id: String,
+    pub root: PathBuf,
+}
+
+/// Which registered project is `workspace_path`.
+///
+/// The root is the primary key: a jj workspace is registered as a project in
+/// its own right, and its directory name is a poor guess at the id (the id may
+/// have been given explicitly at registration, and `/root/trino.io` and
+/// `/root/trino` are different trees whose names slug differently anyway).
+/// Only when no root matches — Henka seeing the tree under a mount path the
+/// client doesn't share — does the basename slug stand in, and then only if
+/// some registered project actually answers to it.
+pub fn resolve_project_id(
+    projects: &[RegisteredProject],
+    workspace_path: &Path,
+) -> Option<String> {
+    let canonical = workspace_path.canonicalize().ok();
+    let matches_workspace = |root: &Path| {
+        root == workspace_path || canonical.as_deref().is_some_and(|c| root == c)
+    };
+    if let Some(project) = projects.iter().find(|p| matches_workspace(&p.root)) {
+        return Some(project.id.clone());
+    }
+
+    let derived = derive_project_id(workspace_path)?;
+    projects
+        .iter()
+        .any(|p| p.id == derived)
+        .then_some(derived)
+}
 
 /// Guess Henka's project id for a workspace path: the slug of its basename.
 ///
@@ -94,5 +130,46 @@ mod tests {
     #[test]
     fn root_has_no_basename() {
         assert!(derive_project_id(&PathBuf::from("/")).is_none());
+    }
+
+    fn registered(id: &str, root: &str) -> RegisteredProject {
+        RegisteredProject {
+            id: id.into(),
+            root: PathBuf::from(root),
+        }
+    }
+
+    #[test]
+    fn registered_root_wins_over_the_basename_guess() {
+        // `/root/trino.io` slugs to `trino-io`, but it is registered as
+        // `trino-website`. Matching the root gets the right project; guessing
+        // from the name would either miss or, worse, hit a different tree.
+        let projects = vec![
+            registered("trino", "/root/trino"),
+            registered("trino-website", "/root/trino.io"),
+        ];
+        assert_eq!(
+            resolve_project_id(&projects, &PathBuf::from("/root/trino.io")).as_deref(),
+            Some("trino-website")
+        );
+    }
+
+    #[test]
+    fn basename_guess_covers_a_root_the_client_cannot_see() {
+        // Henka reads the tree under its own mount, so no root matches the
+        // client's path. The slug still names a registered project.
+        let projects = vec![registered("stargate", "/workspaces/stargate")];
+        assert_eq!(
+            resolve_project_id(&projects, &PathBuf::from("/home/me/src/stargate")).as_deref(),
+            Some("stargate")
+        );
+    }
+
+    #[test]
+    fn unregistered_workspace_resolves_to_nothing() {
+        // Neither root nor id matches: the caller has to say so rather than
+        // send requests against a project that would act on another tree.
+        let projects = vec![registered("trino", "/root/trino")];
+        assert!(resolve_project_id(&projects, &PathBuf::from("/root/stargate")).is_none());
     }
 }

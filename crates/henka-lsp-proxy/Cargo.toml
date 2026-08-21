@@ -23,3 +23,6 @@ rmcp = { workspace = true, features = [
 ] }
 tower-lsp-server = { workspace = true }
 percent-encoding = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

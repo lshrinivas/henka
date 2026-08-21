@@ -9,6 +9,9 @@
 //! caller's namespace on the way out, so the proxy never has to know the
 //! mapping itself.
 
+pub mod backend;
 pub mod config;
+pub mod documents;
 pub mod mcp;
 pub mod project;
+pub mod session;
