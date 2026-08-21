@@ -335,6 +335,88 @@ impl LanguageServer for Backend {
             ..params
         })
     }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> LspResult<Option<serde_json::Value>> {
+        let session = self.session();
+        let binding = session.binding().await?;
+        let op_id = params.command.strip_prefix("henka.").ok_or_else(|| {
+            LspError::invalid_params(format!(
+                "unknown command `{}` (expected henka.<op-id>)",
+                params.command
+            ))
+        })?;
+        if !EXEC_COMMAND_OPS.contains(&op_id) {
+            return Err(LspError::invalid_params(format!(
+                "command `{}` is not exposed via executeCommand",
+                params.command
+            )));
+        }
+        // The client sends a single JSON object matching henka's per-op
+        // parameter schema (see the method-by-method section of the plan).
+        // Anything else is a protocol misuse.
+        let mut args = match params.arguments.into_iter().next() {
+            Some(serde_json::Value::Object(map)) => map,
+            Some(_) => {
+                return Err(LspError::invalid_params(
+                    "executeCommand arguments[0] must be a JSON object",
+                ));
+            }
+            None => serde_json::Map::new(),
+        };
+        // A caller that asks for a dry run wants the edit described, not made.
+        // Anything else means "do it", which for an LSP server means asking the
+        // client to apply the edit: it owns the buffers, and the spec has the
+        // server push a WorkspaceEdit rather than return one — most clients
+        // discard a command's result.
+        let preview_only = args
+            .get("dry_run")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        // Henka always runs as a dry run: the edit is applied through the
+        // client, so letting the server write the files too would apply it
+        // twice, once behind the editor's back.
+        args.insert("dry_run".into(), serde_json::Value::Bool(true));
+
+        // These ops carry a file (and `move` a second one); a coordinate taken
+        // from a buffer with unsaved changes resolves against different code.
+        if let Some(file) = args.get("file").and_then(|v| v.as_str()) {
+            let file = PathBuf::from(file);
+            if let Some(uri) = crate::convert::path_to_uri(&file) {
+                ensure_buffer_saved(session, &uri, &file)?;
+            }
+        }
+
+        let response = session
+            .mcp
+            .call_tool(op_id, binding.call_args(serde_json::Value::Object(args)))
+            .await
+            .map_err(mcp_to_lsp)?;
+        let workspace_edit = workspace_edit_from_response(session, &binding, &response, op_id)?;
+
+        if preview_only {
+            return Ok(Some(serde_json::json!({
+                "applied": false,
+                "dryRun": true,
+                "edit": workspace_edit,
+            })));
+        }
+
+        let outcome = self.client.apply_edit(workspace_edit).await?;
+        if !outcome.applied {
+            tracing::warn!(
+                op = op_id,
+                reason = ?outcome.failure_reason,
+                "client declined to apply the edit"
+            );
+        }
+        Ok(Some(serde_json::json!({
+            "applied": outcome.applied,
+            "failureReason": outcome.failure_reason,
+        })))
+    }
 }
 
 /// Does the client's requested `only` kind match (as a prefix) the op's kind?
