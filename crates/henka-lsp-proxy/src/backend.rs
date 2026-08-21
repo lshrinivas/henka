@@ -22,7 +22,8 @@ use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
 use crate::config::Config;
-use crate::mcp::McpClient;
+use crate::convert::{uri_to_path, usages_to_locations};
+use crate::mcp::{McpClient, McpClientError};
 use crate::session::{OperationDescriptor, Session};
 
 /// Java-only ops that live under `workspace/executeCommand` because they have
@@ -54,7 +55,6 @@ impl Backend {
 
     /// Access to the initialized session. Panics if `initialize` hasn't run;
     /// per LSP spec no other request may precede it.
-    #[allow(dead_code)] // used by handlers wired up in later commits
     pub fn session(&self) -> &Session {
         self.session
             .get()
@@ -150,10 +150,9 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.session().documents.set(
-            &params.text_document.uri,
-            params.text_document.text,
-        );
+        self.session()
+            .documents
+            .set(&params.text_document.uri, params.text_document.text);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -167,6 +166,46 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.session().documents.remove(&params.text_document.uri);
+    }
+
+    async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
+        let session = self.session();
+        let binding = session.binding().await?;
+        let uri = &params.text_document_position.text_document.uri;
+        let Some(file) = uri_to_path(uri) else {
+            return Err(LspError::invalid_params(
+                "textDocument.uri is not a file:// URI",
+            ));
+        };
+        ensure_buffer_saved(session, uri, &file)?;
+        let position = params.text_document_position.position;
+
+        let args = binding.call_args(serde_json::json!({
+            "file": file,
+            "line": position.line,
+            "character": position.character,
+            "include_declaration": params.context.include_declaration,
+        }));
+
+        let response = session
+            .mcp
+            .call_tool("find-usages", args)
+            .await
+            .map_err(mcp_to_lsp)?;
+
+        let locations =
+            usages_to_locations(response, &binding.workspace_path).map_err(mcp_to_lsp)?;
+        Ok(Some(locations))
+    }
+}
+
+/// Turn an MCP error into an LSP error, keeping the henka message verbatim in
+/// `.message` so a client (Claude Code) surfaces it to the operator.
+fn mcp_to_lsp(err: McpClientError) -> LspError {
+    LspError {
+        code: tower_lsp_server::jsonrpc::ErrorCode::InternalError,
+        message: err.to_string().into(),
+        data: None,
     }
 }
 
@@ -193,21 +232,6 @@ fn resolve_workspace_path(params: &InitializeParams) -> Option<PathBuf> {
         return uri_to_path(uri);
     }
     params.root_path.as_ref().map(PathBuf::from)
-}
-
-/// Strip the `file://` prefix from an LSP URI and return the decoded path.
-fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
-    let s = uri.as_str();
-    let rest = s.strip_prefix("file://")?;
-    // Strip the optional host component: `file:///path` → `/path`.
-    let path_part = rest
-        .strip_prefix('/')
-        .map(|r| format!("/{r}"))
-        .unwrap_or_else(|| rest.to_string());
-    let decoded = percent_encoding::percent_decode_str(&path_part)
-        .decode_utf8()
-        .ok()?;
-    Some(PathBuf::from(decoded.as_ref()))
 }
 
 /// Ask henka for `project_status` and log the VCS state, so the operator sees
@@ -325,7 +349,6 @@ fn unfiltered_capabilities() -> ServerCapabilities {
 
 /// Refuse a request whose coordinates came from a buffer that no longer matches
 /// the file henka will read. `path` is the file the request targets.
-#[allow(dead_code)] // used by the position-based handlers in later commits
 fn ensure_buffer_saved(session: &Session, uri: &Uri, path: &Path) -> LspResult<()> {
     session
         .documents
