@@ -9,6 +9,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod convert;
 pub mod mcp;
 pub mod project;
 pub mod session;
