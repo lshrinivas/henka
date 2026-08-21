@@ -49,3 +49,5 @@ sha2 = "0.10"
 walkdir = "2"
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
+tower-lsp-server = "0.22"
+percent-encoding = "2"
