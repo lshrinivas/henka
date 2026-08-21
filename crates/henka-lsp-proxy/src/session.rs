@@ -56,7 +56,7 @@ pub struct OperationDescriptor {
 /// Mirror of `henka_core::operation::TargetKind`. Kept as a small local enum
 /// so the proxy's dependency on henka-core stays surface-level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "lowercase")]
 pub enum TargetKind {
     #[default]
     Position,
@@ -78,18 +78,85 @@ impl Session {
 
     /// Merge `envelope()` fields into `params` (envelope wins on conflict).
     pub fn call_args(&self, params: Value) -> Value {
-        let mut obj = match params {
-            Value::Object(map) => map,
-            _ => serde_json::Map::new(),
-        };
-        obj.insert(
-            "project".into(),
-            Value::String(self.info.identity.project_id.clone()),
+        merge_envelope(
+            params,
+            &self.info.identity.project_id,
+            &self.info.workspace_path,
+        )
+    }
+}
+
+/// Pure form of [`Session::call_args`], factored out for unit testing.
+///
+/// The envelope always wins over a client-supplied `project` / `workspace` so
+/// a caller can't accidentally target a different project. Non-object
+/// `params` (unlikely — the handlers all build objects) are treated as an
+/// empty map.
+pub fn merge_envelope(params: Value, project: &str, workspace: &std::path::Path) -> Value {
+    let mut obj = match params {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("project".into(), Value::String(project.into()));
+    obj.insert(
+        "workspace".into(),
+        Value::String(workspace.display().to_string()),
+    );
+    Value::Object(obj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+
+    #[test]
+    fn envelope_wins_over_caller_supplied_project() {
+        // A client that accidentally sets `project` gets it overridden — the
+        // proxy's derived id is authoritative for the session.
+        let merged = merge_envelope(
+            json!({ "project": "wrong", "file": "Foo.java" }),
+            "stargate",
+            Path::new("/root/stargate"),
         );
-        obj.insert(
-            "workspace".into(),
-            Value::String(self.info.workspace_path.display().to_string()),
+        assert_eq!(merged["project"], json!("stargate"));
+        assert_eq!(merged["file"], json!("Foo.java"));
+    }
+
+    #[test]
+    fn workspace_carries_the_full_container_path() {
+        let merged = merge_envelope(
+            json!({}),
+            "stargate",
+            Path::new("/root/stargate.feature1"),
         );
-        Value::Object(obj)
+        assert_eq!(merged["workspace"], json!("/root/stargate.feature1"));
+    }
+
+    #[test]
+    fn target_kind_deserializes_from_lowercase() {
+        // Henka serializes TargetKind with lowercase names. The proxy must
+        // decode them the same way to keep the code-action target dispatch honest.
+        let desc: OperationDescriptor = serde_json::from_value(json!({
+            "id": "extract-variable",
+            "code_action_kind": "refactor.extract.variable",
+            "target": "selection"
+        }))
+        .unwrap();
+        assert_eq!(desc.target, TargetKind::Selection);
+    }
+
+    #[test]
+    fn missing_target_defaults_to_position() {
+        // Older henka-server payloads didn't include `target`; the default
+        // preserves the previous behaviour for those descriptors.
+        let desc: OperationDescriptor = serde_json::from_value(json!({
+            "id": "find-usages",
+            "code_action_kind": null
+        }))
+        .unwrap();
+        assert_eq!(desc.target, TargetKind::Position);
+        assert_eq!(desc.code_action_kind, None);
     }
 }
