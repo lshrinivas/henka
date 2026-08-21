@@ -7,6 +7,8 @@
 //! LSP client sends (container-side when the proxy runs in a dev container),
 //! and Henka rewrites them through `HENKA_PATH_MAP` on the way in.
 
+pub mod backend;
 pub mod config;
 pub mod mcp;
 pub mod project;
+pub mod session;
