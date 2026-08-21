@@ -146,6 +146,12 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> LspResult<()> {
+        // Close the MCP session rather than leaving it to the transport's
+        // drop: the client is about to send `exit`, and an orderly cancel is
+        // what tells henka this session's work is over.
+        if let Some(session) = self.session.get() {
+            session.mcp.cancel();
+        }
         Ok(())
     }
 

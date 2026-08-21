@@ -4,9 +4,19 @@
 //! go to stderr). The server itself is a `LanguageServer` implementation
 //! driven by `tower-lsp-server`; on `initialize` it opens an MCP session to
 //! henka and every request thereafter becomes one MCP `tools/call`.
+//!
+//! # Cancellation
+//!
+//! LSP `$/cancelRequest` is handled by tower-lsp-server itself: when the
+//! notification arrives, the framework drops the pending request future,
+//! which drops the in-flight `McpClient::call_tool` future. Henka has no
+//! MCP-side cancellation, so the op keeps running to completion on the
+//! server; the client just stops waiting. That is the limitation the
+//! cancellation open question in `docs/lsp-proxy-plan.md` settles on.
 
 use std::process::ExitCode;
 
+use tokio::signal::unix::{SignalKind, signal};
 use tower_lsp_server::{LspService, Server};
 use tracing_subscriber::EnvFilter;
 
@@ -40,7 +50,50 @@ async fn run(config: Config) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let (service, socket) = LspService::new(move |client| Backend::new(client, config.clone()));
-    Server::new(stdin, stdout, socket).serve(service).await;
+
+    // The LSP server drives shutdown itself on `exit` (stdin closes). SIGTERM
+    // and SIGHUP are treated as an equivalent orderly shutdown — otherwise a
+    // parent that kills the child would leave the tokio runtime running.
+    let server = Server::new(stdin, stdout, socket).serve(service);
+    tokio::select! {
+        _ = server => {
+            tracing::info!("LSP server loop exited");
+        }
+        reason = wait_for_signal() => {
+            tracing::info!(reason, "received termination signal, exiting");
+        }
+    }
+}
+
+/// Wait for the first of SIGTERM or SIGHUP. Returns the signal name so
+/// tracing can record which one arrived. Errors constructing a signal
+/// handler collapse to a never-resolving future — signal handling is a
+/// best-effort niceness, not a correctness requirement.
+async fn wait_for_signal() -> &'static str {
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot install SIGTERM handler");
+            return futures_never().await;
+        }
+    };
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot install SIGHUP handler");
+            return futures_never().await;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => "SIGTERM",
+        _ = hup.recv() => "SIGHUP",
+    }
+}
+
+/// A future that never completes. Used when a signal handler failed to
+/// install — the LSP loop should still be the primary shutdown path.
+async fn futures_never() -> &'static str {
+    std::future::pending().await
 }
 
 /// Initialize `tracing` writing to stderr (stdout is the LSP transport).
