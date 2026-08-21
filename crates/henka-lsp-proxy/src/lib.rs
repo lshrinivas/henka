@@ -8,4 +8,5 @@
 //! and Henka rewrites them through `HENKA_PATH_MAP` on the way in.
 
 pub mod config;
+pub mod mcp;
 pub mod project;
