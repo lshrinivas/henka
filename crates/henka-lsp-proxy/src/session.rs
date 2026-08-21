@@ -38,14 +38,31 @@ pub struct Session {
     pub info: SessionInfo,
 }
 
-/// A minimal projection of henka's `OperationDescriptor` — just the fields the
-/// proxy needs to answer LSP capability questions.
+/// A minimal projection of henka's `OperationDescriptor` — just the fields
+/// the proxy needs to answer LSP capability questions and dispatch code
+/// actions.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct OperationDescriptor {
     pub id: String,
     /// LSP CodeActionKind if this op is a code-action refactoring, else `None`.
     #[serde(default)]
     pub code_action_kind: Option<String>,
+    /// The op's target shape — Position, Selection, File, or Project.
+    /// Used to build the right coordinate payload when a code action fires.
+    #[serde(default)]
+    pub target: TargetKind,
+}
+
+/// Mirror of `henka_core::operation::TargetKind`. Kept as a small local enum
+/// so the proxy's dependency on henka-core stays surface-level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum TargetKind {
+    #[default]
+    Position,
+    Selection,
+    File,
+    Project,
 }
 
 impl Session {

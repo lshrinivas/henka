@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::convert::{henka_edit_to_workspace_edit, uri_to_path, usages_to_locations};
 use crate::mcp::{McpClient, McpClientError};
 use crate::project::{WorkspaceIdentity, derive_identity};
-use crate::session::{OperationDescriptor, Session, SessionInfo};
+use crate::session::{OperationDescriptor, Session, SessionInfo, TargetKind};
 
 /// Java-only ops that live under `workspace/executeCommand` because they
 /// have no LSP-standard shape (see plan §4).
@@ -256,6 +256,138 @@ impl LanguageServer for Backend {
                 .map_err(mcp_to_lsp)?;
         Ok(Some(workspace_edit))
     }
+
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> LspResult<Option<CodeActionResponse>> {
+        let session = self.session();
+        let Some(file) = uri_to_path(&params.text_document.uri) else {
+            return Err(LspError::invalid_params(
+                "textDocument.uri is not a file:// URI",
+            ));
+        };
+        let requested = params.context.only.as_deref().unwrap_or(&[]);
+        let range = params.range;
+
+        let mut out: Vec<CodeActionOrCommand> = Vec::new();
+        for descriptor in &session.info.operations {
+            let Some(kind_str) = descriptor.code_action_kind.as_deref() else {
+                continue;
+            };
+            // If the client asked for a specific set of kinds, filter by
+            // prefix (`refactor.extract` matches `refactor.extract.variable`).
+            if !requested.is_empty()
+                && !requested
+                    .iter()
+                    .any(|only| kind_matches_prefix(only.as_str(), kind_str))
+            {
+                continue;
+            }
+
+            let data = serde_json::json!({
+                "op": descriptor.id,
+                "file": file,
+                "range": range,
+            });
+            out.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: descriptor.id.clone(),
+                kind: Some(CodeActionKind::from(kind_str.to_string())),
+                data: Some(data),
+                ..Default::default()
+            }));
+        }
+        Ok(Some(out))
+    }
+
+    async fn code_action_resolve(&self, params: CodeAction) -> LspResult<CodeAction> {
+        let session = self.session();
+        let data = params.data.clone().ok_or_else(|| {
+            LspError::invalid_params("codeAction/resolve request missing `data`")
+        })?;
+        let op_id = data
+            .get("op")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| LspError::invalid_params("codeAction data missing `op`"))?;
+        let descriptor = session
+            .info
+            .operations
+            .iter()
+            .find(|d| d.id == op_id)
+            .ok_or_else(|| {
+                LspError::invalid_params(format!(
+                    "op `{op_id}` is not in the cached catalog for this project"
+                ))
+            })?;
+
+        let file_str = data
+            .get("file")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| LspError::invalid_params("codeAction data missing `file`"))?;
+        let range = data
+            .get("range")
+            .and_then(|v| serde_json::from_value::<Range>(v.clone()).ok())
+            .ok_or_else(|| LspError::invalid_params("codeAction data missing `range`"))?;
+
+        let mut args = serde_json::json!({ "file": file_str, "dry_run": true });
+        add_target_fields(&mut args, descriptor.target, range);
+
+        let response = session
+            .mcp
+            .call_tool(&descriptor.id, session.call_args(args))
+            .await
+            .map_err(mcp_to_lsp)?;
+        let edit_value = response.get("edit").ok_or_else(|| LspError {
+            code: tower_lsp_server::jsonrpc::ErrorCode::InternalError,
+            message: format!(
+                "code-action `{op_id}` dry_run response missing `edit` field"
+            )
+            .into(),
+            data: None,
+        })?;
+        let workspace_edit =
+            henka_edit_to_workspace_edit(edit_value, &session.info.workspace_path)
+                .map_err(mcp_to_lsp)?;
+
+        Ok(CodeAction {
+            edit: Some(workspace_edit),
+            ..params
+        })
+    }
+}
+
+/// Does the client's requested `only` kind match (as a prefix) the op's kind?
+///
+/// LSP spec: `context.only = ["refactor"]` should include every
+/// `refactor.*.*` action. We treat the `.` as the separator to avoid matching
+/// `refactor-foo` against `refactor`.
+fn kind_matches_prefix(only: &str, op_kind: &str) -> bool {
+    if op_kind == only {
+        return true;
+    }
+    op_kind.starts_with(only) && op_kind.as_bytes().get(only.len()) == Some(&b'.')
+}
+
+/// Fill in the target-shape fields (line/character or start_*/end_*) on an
+/// args object based on the descriptor's target kind and the LSP-supplied
+/// range. Whole-file / project ops carry no coordinate.
+fn add_target_fields(args: &mut serde_json::Value, target: TargetKind, range: Range) {
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
+    match target {
+        TargetKind::Position => {
+            obj.insert("line".into(), range.start.line.into());
+            obj.insert("character".into(), range.start.character.into());
+        }
+        TargetKind::Selection => {
+            obj.insert("start_line".into(), range.start.line.into());
+            obj.insert("start_character".into(), range.start.character.into());
+            obj.insert("end_line".into(), range.end.line.into());
+            obj.insert("end_character".into(), range.end.character.into());
+        }
+        TargetKind::File | TargetKind::Project => {}
+    }
 }
 
 /// Turn an MCP error into an LSP error, keeping the henka message verbatim in
@@ -418,7 +550,22 @@ mod tests {
         OperationDescriptor {
             id: id.into(),
             code_action_kind: kind.map(str::to_string),
+            target: TargetKind::Position,
         }
+    }
+
+    #[test]
+    fn kind_matches_prefix_respects_dot_separator() {
+        assert!(kind_matches_prefix("refactor", "refactor.extract.variable"));
+        assert!(kind_matches_prefix("refactor.extract", "refactor.extract.variable"));
+        assert!(kind_matches_prefix(
+            "refactor.extract.variable",
+            "refactor.extract.variable"
+        ));
+        // The prefix must land on a `.` boundary — matching text before a
+        // hyphen or other character would false-positive.
+        assert!(!kind_matches_prefix("refactor.extract", "refactor.extraction"));
+        assert!(!kind_matches_prefix("refactor", "source.organizeImports"));
     }
 
     #[test]
