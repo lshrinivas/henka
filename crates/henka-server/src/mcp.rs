@@ -502,7 +502,15 @@ impl HenkaMcp {
                 });
                 if ops::dry_run(&args) {
                     let files = EditApplier::preview(&edit, &workspace).map_err(into_mcp)?;
-                    ok_json(&json!({ "dry_run": true, "workspace": acted_on, "files": files }))
+                    // Return the structured edit alongside the human-readable
+                    // diff so downstream tools (the LSP proxy in particular)
+                    // can rebuild an LSP WorkspaceEdit without parsing diffs.
+                    ok_json(&json!({
+                        "dry_run": true,
+                        "workspace": acted_on,
+                        "edit": edit,
+                        "files": files,
+                    }))
                 } else {
                     let applied = EditApplier::apply(&edit, &workspace).map_err(into_mcp)?;
                     // When editing the session's own checkout, keep its view
@@ -1115,6 +1123,25 @@ mod tests {
             serde_json::from_str::<Value>(&text).unwrap()["workspace"]["workspace"].clone()
         };
         assert_eq!(echoed(&preview).as_str(), root.to_str());
+
+        // The dry-run response carries the structured edit itself so callers
+        // that want to rebuild an editor-native edit (e.g. an LSP proxy) don't
+        // have to parse the unified-diff text back into text edits.
+        let preview_body: Value = {
+            let text = match &preview.content[0].raw {
+                rmcp::model::RawContent::Text(t) => t.text.clone(),
+                _ => panic!("expected text content"),
+            };
+            serde_json::from_str(&text).unwrap()
+        };
+        let edit = preview_body.get("edit").expect("edit field present");
+        assert_eq!(edit["encoding"], json!("Utf16"));
+        let files = edit["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], json!("Main.java"));
+        let edits = files[0]["edits"].as_array().expect("edits array");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["new_text"], json!("X"));
 
         // Apply.
         let applied = mcp
