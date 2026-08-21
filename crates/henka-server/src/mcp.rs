@@ -502,7 +502,25 @@ impl HenkaMcp {
                 });
                 if ops::dry_run(&args) {
                     let files = EditApplier::preview(&edit, &workspace).map_err(into_mcp)?;
-                    ok_json(&json!({ "dry_run": true, "workspace": acted_on, "files": files }))
+                    // The diff text and `files` name paths relative to the
+                    // working copy, but an absolute path in the structured edit
+                    // is one Henka resolved on its own filesystem. Rewrite
+                    // those back to the caller's namespace — the same
+                    // translation `project_status` reports as `host_path` —
+                    // so a caller that applies the edit itself (an editor
+                    // behind the LSP proxy) names files it can actually open.
+                    if let Some(caller_root) = self.path_map.reverse(&workspace) {
+                        edit.retarget(&workspace, &caller_root);
+                    }
+                    // Return the structured edit alongside the human-readable
+                    // diff so downstream tools (the LSP proxy in particular)
+                    // can rebuild an LSP WorkspaceEdit without parsing diffs.
+                    ok_json(&json!({
+                        "dry_run": true,
+                        "workspace": acted_on,
+                        "edit": edit,
+                        "files": files,
+                    }))
                 } else {
                     let applied = EditApplier::apply(&edit, &workspace).map_err(into_mcp)?;
                     // When editing the session's own checkout, keep its view
@@ -1116,6 +1134,25 @@ mod tests {
         };
         assert_eq!(echoed(&preview).as_str(), root.to_str());
 
+        // The dry-run response carries the structured edit itself so callers
+        // that want to rebuild an editor-native edit (e.g. an LSP proxy) don't
+        // have to parse the unified-diff text back into text edits.
+        let preview_body: Value = {
+            let text = match &preview.content[0].raw {
+                rmcp::model::RawContent::Text(t) => t.text.clone(),
+                _ => panic!("expected text content"),
+            };
+            serde_json::from_str(&text).unwrap()
+        };
+        let edit = preview_body.get("edit").expect("edit field present");
+        assert_eq!(edit["encoding"], json!("Utf16"));
+        let files = edit["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], json!("Main.java"));
+        let edits = files[0]["edits"].as_array().expect("edits array");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["new_text"], json!("X"));
+
         // Apply.
         let applied = mcp
             .handle_call(call(
@@ -1340,6 +1377,46 @@ mod tests {
         assert_eq!(
             value.get("host_path").and_then(Value::as_str),
             Some("/host/src/proj")
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_edit_reports_paths_in_the_caller_namespace() {
+        // The caller names a file by its own path and the map rewrites it onto
+        // what Henka sees. An absolute path in the returned edit has to make
+        // the trip back, or a caller that applies the edit itself — an editor
+        // behind the LSP proxy — is handed a path it cannot open.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut mcp, root) = handler_with_project(dir.path());
+        let canon_root = root.canonicalize().unwrap();
+        let parent = canon_root.parent().unwrap();
+        mcp.path_map = Arc::new(PathMap::parse(&format!("/host/src={}", parent.display())));
+
+        let res = mcp
+            .handle_call(call(
+                "insert-text",
+                args(json!({
+                    "project": "p",
+                    "workspace": "/host/src/proj",
+                    "file": "/host/src/proj/Main.java",
+                    "line": 0,
+                    "character": 0,
+                    "text": "X",
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(res.is_error, Some(true));
+
+        let text = match &res.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["edit"]["files"][0]["path"].as_str(),
+            Some("/host/src/proj/Main.java"),
+            "edit path stays in the caller's namespace: {value}"
         );
     }
 
