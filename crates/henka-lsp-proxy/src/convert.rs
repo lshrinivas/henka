@@ -3,9 +3,14 @@
 //! Kept in one module so the position-encoding contract (UTF-16 both sides)
 //! and URI ↔ path handling live in one place.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use tower_lsp_server::lsp_types::{Location, Position, Range, Uri};
+use tower_lsp_server::lsp_types::{
+    CreateFile, DeleteFile, DocumentChangeOperation, DocumentChanges, Location, OneOf,
+    OptionalVersionedTextDocumentIdentifier, Position, Range, RenameFile, ResourceOp, TextEdit,
+    Uri, WorkspaceEdit,
+};
 
 use crate::mcp::McpClientError;
 
@@ -97,6 +102,153 @@ fn read_position(v: &serde_json::Value, line_key: &str, char_key: &str) -> Posit
     Position { line, character }
 }
 
+/// Convert henka's structured `WorkspaceEdit` (returned inside dry_run
+/// responses since the `Include structured WorkspaceEdit in dry_run` change)
+/// into an LSP `WorkspaceEdit`.
+///
+/// Uses `documentChanges` because henka may emit `file_ops` (create / rename /
+/// delete) alongside text edits, which the `changes` map alone can't express.
+/// Text-only edits still land in `documentChanges` as `TextDocumentEdit`s —
+/// this way there's one path for both cases.
+pub fn henka_edit_to_workspace_edit(
+    value: &serde_json::Value,
+    workspace_path: &Path,
+) -> Result<WorkspaceEdit, McpClientError> {
+    let files = value
+        .get("files")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let file_ops = value
+        .get("file_ops")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut ops: Vec<DocumentChangeOperation> = Vec::new();
+
+    for file in files {
+        let Some(path) = file.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let abs = absolutize(path, workspace_path);
+        let Some(uri) = path_to_uri(&abs) else {
+            continue;
+        };
+        let edits: Vec<TextEdit> = file
+            .get("edits")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(text_edit_from_henka)
+            .collect();
+        ops.push(DocumentChangeOperation::Edit(
+            tower_lsp_server::lsp_types::TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            },
+        ));
+    }
+
+    for op in file_ops {
+        let Some(kind) = op.get("op").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let resource_op = match kind {
+            "create" => op
+                .get("path")
+                .and_then(|v| v.as_str())
+                .and_then(|p| path_to_uri(&absolutize(p, workspace_path)))
+                .map(|uri| ResourceOp::Create(CreateFile { uri, options: None, annotation_id: None })),
+            "delete" => op
+                .get("path")
+                .and_then(|v| v.as_str())
+                .and_then(|p| path_to_uri(&absolutize(p, workspace_path)))
+                .map(|uri| ResourceOp::Delete(DeleteFile { uri, options: None })),
+            "rename" => {
+                let from = op
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .and_then(|p| path_to_uri(&absolutize(p, workspace_path)));
+                let to = op
+                    .get("to")
+                    .and_then(|v| v.as_str())
+                    .and_then(|p| path_to_uri(&absolutize(p, workspace_path)));
+                match (from, to) {
+                    (Some(old_uri), Some(new_uri)) => Some(ResourceOp::Rename(RenameFile {
+                        old_uri,
+                        new_uri,
+                        options: None,
+                        annotation_id: None,
+                    })),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(op) = resource_op {
+            ops.push(DocumentChangeOperation::Op(op));
+        }
+    }
+
+    let document_changes = if ops.is_empty() {
+        None
+    } else {
+        Some(DocumentChanges::Operations(ops))
+    };
+
+    // Some LSP clients only look at `changes`. Fill it in from the text edits
+    // for maximum compatibility; the resource ops still need documentChanges.
+    let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+    if let Some(DocumentChanges::Operations(ops)) = &document_changes {
+        for op in ops {
+            if let DocumentChangeOperation::Edit(edit) = op {
+                changes
+                    .entry(edit.text_document.uri.clone())
+                    .or_default()
+                    .extend(edit.edits.iter().filter_map(|oneof| match oneof {
+                        OneOf::Left(te) => Some(te.clone()),
+                        OneOf::Right(_) => None,
+                    }));
+            }
+        }
+    }
+
+    Ok(WorkspaceEdit {
+        changes: if changes.is_empty() { None } else { Some(changes) },
+        document_changes,
+        change_annotations: None,
+    })
+}
+
+fn text_edit_from_henka(edit: serde_json::Value) -> Option<TextEdit> {
+    let range = edit.get("range")?;
+    let start = range.get("start")?;
+    let end = range.get("end")?;
+    let range = Range {
+        start: Position {
+            line: start.get("line")?.as_u64()? as u32,
+            character: start.get("character")?.as_u64()? as u32,
+        },
+        end: Position {
+            line: end.get("line")?.as_u64()? as u32,
+            character: end.get("character")?.as_u64()? as u32,
+        },
+    };
+    let new_text = edit.get("new_text")?.as_str()?.to_string();
+    Some(TextEdit { range, new_text })
+}
+
+fn absolutize(path: &str, workspace_path: &Path) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        workspace_path.join(p)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +294,58 @@ mod tests {
         assert_eq!(locs[0].uri.as_str(), "file:///root/stargate/src/Foo.java");
         assert_eq!(locs[0].range.start.line, 3);
         assert_eq!(locs[0].range.end.character, 7);
+    }
+
+    #[test]
+    fn henka_edit_maps_to_text_document_edits() {
+        // Shape: what henka's dry_run response now carries in `edit`.
+        let response = json!({
+            "edit": {
+                "encoding": "Utf16",
+                "files": [
+                    {
+                        "path": "src/Foo.java",
+                        "edits": [
+                            {
+                                "range": {
+                                    "start": { "line": 1, "character": 4 },
+                                    "end": { "line": 1, "character": 7 }
+                                },
+                                "new_text": "Bar"
+                            }
+                        ]
+                    }
+                ],
+                "file_ops": []
+            }
+        });
+        let root = Path::new("/root/stargate");
+        let ws_edit = henka_edit_to_workspace_edit(&response["edit"], root).unwrap();
+        // `changes` map populated for legacy clients.
+        let changes = ws_edit.changes.as_ref().unwrap();
+        let uri = Uri::from_str("file:///root/stargate/src/Foo.java").unwrap();
+        assert_eq!(changes.get(&uri).unwrap().len(), 1);
+        // documentChanges carries the same edit.
+        assert!(matches!(
+            ws_edit.document_changes.as_ref().unwrap(),
+            DocumentChanges::Operations(_)
+        ));
+    }
+
+    #[test]
+    fn henka_edit_carries_file_ops() {
+        let edit = json!({
+            "encoding": "Utf16",
+            "files": [],
+            "file_ops": [
+                { "op": "rename", "from": "src/Foo.java", "to": "src/Bar.java" }
+            ]
+        });
+        let ws_edit = henka_edit_to_workspace_edit(&edit, Path::new("/root/stargate")).unwrap();
+        let Some(DocumentChanges::Operations(ops)) = &ws_edit.document_changes else {
+            panic!("expected Operations, got {ws_edit:?}");
+        };
+        assert!(matches!(&ops[0], DocumentChangeOperation::Op(ResourceOp::Rename(_))));
     }
 
     #[test]

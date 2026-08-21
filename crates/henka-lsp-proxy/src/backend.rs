@@ -16,7 +16,7 @@ use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
 use crate::config::Config;
-use crate::convert::{uri_to_path, usages_to_locations};
+use crate::convert::{henka_edit_to_workspace_edit, uri_to_path, usages_to_locations};
 use crate::mcp::{McpClient, McpClientError};
 use crate::project::{WorkspaceIdentity, derive_identity};
 use crate::session::{OperationDescriptor, Session, SessionInfo};
@@ -205,6 +205,56 @@ impl LanguageServer for Backend {
         let locations = usages_to_locations(response, &session.info.workspace_path)
             .map_err(mcp_to_lsp)?;
         Ok(Some(locations))
+    }
+
+    async fn prepare_rename(
+        &self,
+        _params: TextDocumentPositionParams,
+    ) -> LspResult<Option<PrepareRenameResponse>> {
+        // Henka has no dedicated prepare-rename op; a speculative rename would
+        // be much more expensive than letting the client use the identifier
+        // at the cursor. defaultBehavior tells the client to do exactly that
+        // (plan §5).
+        Ok(Some(PrepareRenameResponse::DefaultBehavior {
+            default_behavior: true,
+        }))
+    }
+
+    async fn rename(
+        &self,
+        params: RenameParams,
+    ) -> LspResult<Option<WorkspaceEdit>> {
+        let session = self.session();
+        let Some(file) = uri_to_path(&params.text_document_position.text_document.uri) else {
+            return Err(LspError::invalid_params(
+                "textDocument.uri is not a file:// URI",
+            ));
+        };
+        let position = params.text_document_position.position;
+
+        let args = session.call_args(serde_json::json!({
+            "file": file,
+            "line": position.line,
+            "character": position.character,
+            "new_name": params.new_name,
+            "dry_run": true,
+        }));
+
+        let response = session
+            .mcp
+            .call_tool("rename", args)
+            .await
+            .map_err(mcp_to_lsp)?;
+
+        let edit_value = response.get("edit").ok_or_else(|| LspError {
+            code: tower_lsp_server::jsonrpc::ErrorCode::InternalError,
+            message: "rename dry_run response missing `edit` field — is henka-server new enough?".into(),
+            data: None,
+        })?;
+        let workspace_edit =
+            henka_edit_to_workspace_edit(edit_value, &session.info.workspace_path)
+                .map_err(mcp_to_lsp)?;
+        Ok(Some(workspace_edit))
     }
 }
 
