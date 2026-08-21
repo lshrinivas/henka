@@ -56,8 +56,9 @@ pub struct Binding {
     pub operations: Vec<OperationDescriptor>,
 }
 
-/// A minimal projection of henka's `OperationDescriptor` — just the fields the
-/// proxy needs to answer LSP capability questions.
+/// A minimal projection of henka's `OperationDescriptor` — just the fields
+/// the proxy needs to answer LSP capability questions and dispatch code
+/// actions.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct OperationDescriptor {
     pub id: String,
@@ -66,6 +67,59 @@ pub struct OperationDescriptor {
     /// LSP CodeActionKind if this op is a code-action refactoring, else `None`.
     #[serde(default)]
     pub code_action_kind: Option<String>,
+    /// The op's target shape — Position, Selection, File, or Project.
+    /// Used to build the right coordinate payload when a code action fires.
+    #[serde(default)]
+    pub target: TargetKind,
+    /// The languages the op applies to, as Henka's lowercase language ids.
+    /// `list_operations` filters by project, not by file, so a project holding
+    /// both Java and Rust returns Java-only ops too — without this the menu on
+    /// a `.rs` buffer would offer them.
+    #[serde(default)]
+    pub languages: Vec<String>,
+}
+
+impl OperationDescriptor {
+    /// Whether this operation applies to `file`, going by its language.
+    ///
+    /// An extension the proxy doesn't recognize is not a reason to hide an
+    /// action: Henka may support a language this list predates, and it decides
+    /// for itself when the op runs. The same goes for a descriptor that names
+    /// no languages at all.
+    pub fn applies_to(&self, file: &Path) -> bool {
+        if self.languages.is_empty() {
+            return true;
+        }
+        match language_of(file) {
+            Some(language) => self.languages.iter().any(|l| l == language),
+            None => true,
+        }
+    }
+}
+
+/// Henka's language id for a file, by extension. Mirrors
+/// `henka_core::Language::from_path`; kept local so the proxy doesn't depend on
+/// henka-core just to read a file extension.
+fn language_of(file: &Path) -> Option<&'static str> {
+    match file.extension().and_then(|e| e.to_str()) {
+        Some("java") => Some("java"),
+        Some("rs") => Some("rust"),
+        Some("ts" | "tsx" | "mts" | "cts") => Some("typescript"),
+        Some("js" | "jsx" | "mjs" | "cjs") => Some("javascript"),
+        _ => None,
+    }
+}
+
+/// Mirror of `henka_core::operation::TargetKind`. Kept as a small local enum
+/// so the proxy's dependency on henka-core stays surface-level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetKind {
+    #[default]
+    Position,
+    Selection,
+    File,
+    Project,
 }
 
 impl Session {
@@ -158,6 +212,11 @@ impl Session {
 }
 
 impl Binding {
+    /// The descriptor for an op id, if the catalog holds one.
+    pub fn operation(&self, id: &str) -> Option<&OperationDescriptor> {
+        self.operations.iter().find(|d| d.id == id)
+    }
+
     /// The envelope every tool call must carry: project id + explicit
     /// workspace path. Sent unconditionally even for the base workspace so
     /// henka doesn't have to infer it — `dispatch_operation` on the server side
@@ -278,6 +337,74 @@ mod tests {
             ..Default::default()
         };
         assert!(client_supports_document_changes(&params));
+    }
+
+    #[test]
+    fn target_kind_deserializes_from_lowercase() {
+        // Henka serializes TargetKind with lowercase names. The proxy must
+        // decode them the same way to keep the code-action target dispatch
+        // honest — a mis-decoded kind sends a position where a selection was
+        // meant.
+        let desc: OperationDescriptor = serde_json::from_value(json!({
+            "id": "extract-variable",
+            "title": "Extract variable",
+            "code_action_kind": "refactor.extract.variable",
+            "target": "selection"
+        }))
+        .unwrap();
+        assert_eq!(desc.target, TargetKind::Selection);
+    }
+
+    #[test]
+    fn missing_target_defaults_to_position() {
+        // Older henka-server payloads didn't include `target`; the default
+        // preserves the previous behaviour for those descriptors.
+        let desc: OperationDescriptor = serde_json::from_value(json!({
+            "id": "find-usages",
+            "title": "Find usages",
+            "code_action_kind": null
+        }))
+        .unwrap();
+        assert_eq!(desc.target, TargetKind::Position);
+        assert_eq!(desc.code_action_kind, None);
+    }
+
+    #[test]
+    fn an_operation_applies_only_to_its_languages() {
+        let desc: OperationDescriptor = serde_json::from_value(json!({
+            "id": "organize-imports",
+            "title": "Organize imports",
+            "code_action_kind": "source.organizeImports",
+            "languages": ["java"],
+        }))
+        .unwrap();
+        assert!(desc.applies_to(Path::new("/root/p/src/Foo.java")));
+        // The catalog is per-project, so a Java-only op comes back for a
+        // project that also holds Rust. It must not be offered on the buffer.
+        assert!(!desc.applies_to(Path::new("/root/p/src/lib.rs")));
+    }
+
+    #[test]
+    fn an_unknown_extension_is_left_to_henka() {
+        let desc: OperationDescriptor = serde_json::from_value(json!({
+            "id": "organize-imports",
+            "title": "Organize imports",
+            "languages": ["java"],
+        }))
+        .unwrap();
+        // Not something the proxy's extension table knows: hiding the action
+        // would be a guess, and henka rejects the op itself if it doesn't fit.
+        assert!(desc.applies_to(Path::new("/root/p/notes.txt")));
+    }
+
+    #[test]
+    fn a_descriptor_naming_no_languages_applies_everywhere() {
+        let desc: OperationDescriptor = serde_json::from_value(json!({
+            "id": "rename",
+            "title": "Rename",
+        }))
+        .unwrap();
+        assert!(desc.applies_to(Path::new("/root/p/src/lib.rs")));
     }
 
     #[test]
