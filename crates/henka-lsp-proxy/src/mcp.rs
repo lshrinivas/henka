@@ -36,6 +36,11 @@ pub enum McpClientError {
     /// The tool returned no content, or content the wrapper doesn't understand.
     #[error("MCP tool `{tool}` returned no text content")]
     EmptyResult { tool: String },
+    /// The tool returned an edit the proxy can't turn into an LSP
+    /// `WorkspaceEdit` in full. Applying the translatable part would leave the
+    /// tree half-refactored, so the whole request fails instead.
+    #[error("henka returned an edit the proxy cannot apply: {0}")]
+    UntranslatableEdit(String),
     /// The tool's returned JSON couldn't be parsed.
     #[error("MCP tool `{tool}` returned malformed JSON: {source}")]
     BadJson {
