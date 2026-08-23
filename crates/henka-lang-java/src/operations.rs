@@ -612,6 +612,56 @@ impl Operation for MoveOp {
     }
 }
 
+/// Search for symbols across the project by name query.
+pub struct SymbolSearchOp;
+
+#[async_trait]
+impl Operation for SymbolSearchOp {
+    fn descriptor(&self) -> OperationDescriptor {
+        OperationDescriptor {
+            id: "symbol-search".into(),
+            title: "Symbol search".into(),
+            description: "Search for symbols across the project by name query.".into(),
+            kind: OperationKind::Query,
+            languages: vec![Language::Java],
+            target: TargetKind::Project,
+            params_schema: json!({
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Partial or full symbol name to search for."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn run(
+        &self,
+        ctx: &OperationCtx<'_>,
+        req: &OperationRequest,
+    ) -> CoreResult<OperationOutcome> {
+        let session = jdtls(ctx)?;
+        let query = req
+            .params
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        session.ensure_indexed().await.map_err(backend)?;
+        let result: Value = session
+            .client()
+            .request("workspace/symbol", json!({ "query": query }))
+            .await
+            .map_err(backend)?;
+
+        let out = lsp::symbols_to_query(result, session.root()).map_err(backend)?;
+        Ok(OperationOutcome::Query(out))
+    }
+}
+
 /// Find every reference to the symbol at a position.
 pub struct FindUsagesOp;
 

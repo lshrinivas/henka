@@ -8,6 +8,6 @@ pub mod framing;
 pub mod session;
 
 pub use client::LspClient;
-pub use convert::{locations_to_query, to_core_workspace_edit, uri_to_path};
+pub use convert::{locations_to_query, symbols_to_query, to_core_workspace_edit, uri_to_path};
 pub use error::{LspError, Result};
 pub use session::{LspSession, path_to_file_uri};
