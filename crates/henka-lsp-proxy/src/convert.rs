@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use tower_lsp_server::lsp_types::{
     CreateFile, DeleteFile, DocumentChangeOperation, DocumentChanges, Location, OneOf,
-    OptionalVersionedTextDocumentIdentifier, Position, Range, RenameFile, ResourceOp, TextEdit,
-    Uri, WorkspaceEdit,
+    OptionalVersionedTextDocumentIdentifier, Position, Range, RenameFile, ResourceOp, SymbolKind,
+    TextEdit, Uri, WorkspaceEdit, WorkspaceSymbol,
 };
 
 use crate::mcp::McpClientError;
@@ -91,6 +91,67 @@ pub fn usages_to_locations(
         out.push(Location {
             uri,
             range: Range { start, end },
+        });
+    }
+    Ok(out)
+}
+
+/// Turn henka's `symbol-search` response into an LSP `Vec<WorkspaceSymbol>`.
+///
+/// Henka returns `{ "count": N, "symbols": [{ "name", "kind", "file",
+/// "start_line", "start_character", "end_line", "end_character",
+/// "container_name"? }, ...] }` with paths relative to the workspace root.
+pub fn response_to_workspace_symbols(
+    value: serde_json::Value,
+    workspace_path: &Path,
+) -> Result<Vec<WorkspaceSymbol>, McpClientError> {
+    let symbols = value
+        .get("symbols")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = Vec::with_capacity(symbols.len());
+    for sym in symbols {
+        let Some(name) = sym.get("name").and_then(|v| v.as_str()).map(str::to_string) else {
+            continue;
+        };
+        let kind_int = sym.get("kind").and_then(|v| v.as_i64()).unwrap_or(13);
+        let kind: SymbolKind = serde_json::from_value(serde_json::json!(kind_int))
+            .unwrap_or(SymbolKind::VARIABLE);
+        let Some(file) = sym.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let abs = if std::path::Path::new(file).is_absolute() {
+            PathBuf::from(file)
+        } else {
+            workspace_path.join(file)
+        };
+        let container_name = sym
+            .get("container_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        let start = read_position(&sym, "start_line", "start_character");
+        let end = read_position(&sym, "end_line", "end_character");
+        let range = Range { start, end };
+
+        // Use a location with a range when available; fall back to a
+        // range-less location only if the URI can't be built (shouldn't happen).
+        let location = if let Some(uri) = path_to_uri(&abs) {
+            OneOf::Left(Location { uri, range })
+        } else {
+            // Skip symbols we can't form a URI for.
+            continue;
+        };
+
+        out.push(WorkspaceSymbol {
+            name,
+            kind,
+            location,
+            container_name,
+            tags: None,
+            data: None,
         });
     }
     Ok(out)
