@@ -16,7 +16,9 @@ use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
 use crate::config::Config;
-use crate::convert::{henka_edit_to_workspace_edit, uri_to_path, usages_to_locations};
+use crate::convert::{
+    henka_edit_to_workspace_edit, response_to_workspace_symbols, uri_to_path, usages_to_locations,
+};
 use crate::mcp::{McpClient, McpClientError};
 use crate::project::{WorkspaceIdentity, derive_identity};
 use crate::session::{OperationDescriptor, Session, SessionInfo, TargetKind};
@@ -29,6 +31,7 @@ const EXEC_COMMAND_OPS: &[&str] = &["change-signature", "move"];
 /// leave off the capability list (henka may grow ops that don't yet map).
 const STANDARD_OP_REFERENCES: &str = "find-usages";
 const STANDARD_OP_RENAME: &str = "rename";
+const STANDARD_OP_SYMBOL_SEARCH: &str = "symbol-search";
 
 /// The tower-lsp backend. Owns the MCP session once initialize has run.
 pub struct Backend {
@@ -409,6 +412,22 @@ impl LanguageServer for Backend {
             }
         })?))
     }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> LspResult<Option<OneOf<Vec<SymbolInformation>, Vec<WorkspaceSymbol>>>> {
+        let session = self.session();
+        let args = session.call_args(serde_json::json!({ "query": params.query }));
+        let response = session
+            .mcp
+            .call_tool("symbol-search", args)
+            .await
+            .map_err(mcp_to_lsp)?;
+        let symbols = response_to_workspace_symbols(response, &session.info.workspace_path)
+            .map_err(mcp_to_lsp)?;
+        Ok(Some(OneOf::Right(symbols)))
+    }
 }
 
 /// Does the client's requested `only` kind match (as a prefix) the op's kind?
@@ -569,6 +588,9 @@ fn advertise_capabilities(operations: &[OperationDescriptor]) -> ServerCapabilit
             work_done_progress_options: Default::default(),
         }));
     }
+    if ids.contains(STANDARD_OP_SYMBOL_SEARCH) {
+        caps.workspace_symbol_provider = Some(OneOf::Left(true));
+    }
 
     let action_kinds: Vec<CodeActionKind> = operations
         .iter()
@@ -630,7 +652,17 @@ mod tests {
         assert!(caps.rename_provider.is_none());
         assert!(caps.code_action_provider.is_none());
         assert!(caps.execute_command_provider.is_none());
+        assert!(caps.workspace_symbol_provider.is_none());
         assert_eq!(caps.position_encoding, Some(PositionEncodingKind::UTF16));
+    }
+
+    #[test]
+    fn symbol_search_op_advertises_workspace_symbol_provider() {
+        let caps = advertise_capabilities(&[desc("symbol-search", None)]);
+        assert!(
+            matches!(caps.workspace_symbol_provider, Some(OneOf::Left(true))),
+            "expected workspace_symbol_provider = true"
+        );
     }
 
     #[test]

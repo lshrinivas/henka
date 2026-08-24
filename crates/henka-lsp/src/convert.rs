@@ -210,6 +210,52 @@ pub fn locations_to_query(value: Value, root: &Path) -> Result<Value> {
     Ok(json!({ "count": usages.len(), "usages": usages }))
 }
 
+/// Convert an LSP `SymbolInformation[]` response (from `workspace/symbol`) into
+/// a structured symbol-search result, with paths expressed relative to `root`
+/// where possible.
+pub fn symbols_to_query(value: Value, root: &Path) -> Result<Value> {
+    if value.is_null() {
+        return Ok(json!({ "count": 0, "symbols": [] }));
+    }
+    let items: Vec<LspSymbolInfo> = serde_json::from_value(value)?;
+
+    let symbols: Vec<Value> = items
+        .into_iter()
+        .map(|s| {
+            let path = uri_to_path(&s.location.uri);
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let mut obj = json!({
+                "name": s.name,
+                "kind": s.kind,
+                "file": rel,
+                "start_line": s.location.range.start.line,
+                "start_character": s.location.range.start.character,
+                "end_line": s.location.range.end.line,
+                "end_character": s.location.range.end.character,
+            });
+            if let Some(container) = s.container_name {
+                obj["container_name"] = json!(container);
+            }
+            obj
+        })
+        .collect();
+
+    Ok(json!({ "count": symbols.len(), "symbols": symbols }))
+}
+
+#[derive(Debug, Deserialize)]
+struct LspSymbolInfo {
+    name: String,
+    kind: u32,
+    location: LspLocation,
+    #[serde(rename = "containerName", default)]
+    container_name: Option<String>,
+}
+
 /// Convert a `file://` URI back to a path, decoding the characters we encode.
 pub fn uri_to_path(uri: &str) -> PathBuf {
     let rest = uri.strip_prefix("file://").unwrap_or(uri);
