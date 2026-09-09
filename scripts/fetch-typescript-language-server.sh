@@ -10,8 +10,11 @@
 set -euo pipefail
 
 dest="${1:-.cache/typescript-language-server}"
-ls_version="${TYPESCRIPT_LANGUAGE_SERVER_VERSION:-latest}"
-ts_version="${TYPESCRIPT_VERSION:-latest}"
+# Pinned, not `latest`: typescript 7 is the native rewrite and ships no
+# `lib/tsserver.js`, which is the only thing typescript-language-server can
+# drive. Floating either version silently breaks the install on a refetch.
+ls_version="${TYPESCRIPT_LANGUAGE_SERVER_VERSION:-6}"
+ts_version="${TYPESCRIPT_VERSION:-5}"
 
 if ! command -v npm >/dev/null 2>&1; then
   echo "npm is required to fetch typescript-language-server (Node toolchain)" >&2

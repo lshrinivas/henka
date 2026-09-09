@@ -1,0 +1,21 @@
+{
+  "henka": {
+    "command": "henka-lsp.sh",
+    "args": [],
+    "transport": "stdio",
+    "env": {
+      "HENKA_LSP_ADDR": "host.docker.internal:8182"
+    },
+    "extensionToLanguage": {
+      ".java": "java",
+      ".js": "javascript",
+      ".ts": "typescript",
+      ".jsx": "javascriptreact",
+      ".tsx": "typescriptreact",
+      ".rs": "rust"
+    },
+    "workspaceFolder": "${CLAUDE_PROJECT_DIR}",
+    "restartOnCrash": true,
+    "diagnostics": false
+  }
+}

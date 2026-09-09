@@ -46,13 +46,48 @@ id (plus a combined `digest`), which the client reproduces in its own checkout
 with `git hash-object` to confirm Henka reads the same tree — the same edit at a
 different mount path yields the same ids.
 
+## The LSP surface
+
+Besides MCP, Henka can serve the same operations over the **Language Server
+Protocol**, so an editor (or an agent that speaks LSP) reaches its semantic
+queries and refactorings without an MCP client. It is **opt-in** and listens on
+its own port, `8182` by default, in the same process as MCP.
+
+Enable it with the `--lsp` flag (and, for a non-default address, `--lsp-bind
+<addr>`), or with a server configuration file. That file, `henka.toml`, is kept
+separate from the project registry (`projects.toml`) — the registry is rewritten
+whenever a project is registered, so operator settings live apart from it:
+
+```toml
+[lsp]
+enabled = true
+bind = "0.0.0.0:8182"   # inside the container; loopback (the default) is unreachable from outside
+```
+
+Its path resolves as `$HENKA_SERVER_CONFIG`, else `$HENKA_DATA/henka.toml`, else
+`$XDG_CONFIG_HOME/henka/henka.toml`; `--server-config <path>` overrides it. Where
+a setting appears in more than one place, the command line wins over the file,
+which wins over the built-in default.
+
+Like the MCP transport, **the LSP surface is unauthenticated**: binding it beyond
+loopback exposes every registered project to anyone who can reach the port. The
+compose file publishes it on `127.0.0.1` by default for the same reason MCP is.
+
+A client reaches the port through a generic stdio-to-TCP relay — nothing
+Henka-specific runs on the client side. The `clients/henka-lsp/` directory holds
+`henka-lsp.sh` (a `socat` wrapper) and an `.lsp.json` to point an editor at it;
+see that directory's README. The port in the client's `HENKA_LSP_ADDR` must match
+the server's `--lsp-bind` port.
+
 Configuration knobs (environment variables, all optional):
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `HENKA_IMAGE` | `ghcr.io/martint/henka:latest` | Image to run. |
 | `HENKA_PUBLISH_ADDR` | `127.0.0.1` | Host interface Docker publishes the port on (the container always binds `0.0.0.0`). |
-| `HENKA_PUBLISH_PORT` | `8181` | Host port. |
+| `HENKA_PUBLISH_PORT` | `8181` | Host port for MCP. |
+| `HENKA_LSP_PUBLISH_ADDR` | `127.0.0.1` | Host interface Docker publishes the LSP port on. Loopback by default — the LSP surface is unauthenticated. |
+| `HENKA_LSP_PUBLISH_PORT` | `8182` | Host port for the LSP surface. The compose file enables the surface (`--lsp`); drop it and this port line to turn it off. |
 | `HENKA_WORKSPACES_DIR` | _(required)_ | Host directory of working copies, mounted read-write at `/workspaces`. The compose file also uses it to build the path-translation map. |
 | `HENKA_PATH_MAP` | _(none)_ | Extra `host=container` prefix rewrites (comma-separated) for additional mounts, appended to the `HENKA_WORKSPACES_DIR`→`/workspaces` rewrite the compose file derives. |
 | `HENKA_AUTO_REGISTER_ROOTS` | path-map mounts + `/workspaces` | Directories whose immediate children are auto-registered as projects (comma-separated). Set empty to disable and register every project by hand. |

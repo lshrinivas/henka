@@ -117,7 +117,9 @@ RUN mkdir -p /data /home/henka && chmod 0777 /data /home/henka
 # Settle the data dir on a well-known path so a bare `docker run` works without
 # operator setup. Persist via `-v henka-data:/data`.
 VOLUME ["/data"]
-EXPOSE 8181
+# 8181 = MCP (the default command). 8182 = the optional LSP surface, served when
+# the command is given `--lsp`.
+EXPOSE 8181 8182
 ENTRYPOINT ["henka"]
 # Bind to every interface inside the container — loopback would be unreachable
 # from outside. Host-side port mapping decides external reachability.

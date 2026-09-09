@@ -22,13 +22,22 @@ services:
     # 0.0.0.0 only behind a proxy that terminates auth, or on a trusted network.
     ports:
       - "${HENKA_PUBLISH_ADDR:-127.0.0.1}:${HENKA_PUBLISH_PORT:-8181}:8181"
+      # The LSP surface (see `command` below). Loopback by default — it is
+      # unauthenticated, like MCP. Drop this line and the `--lsp` args if you
+      # don't want it.
+      - "${HENKA_LSP_PUBLISH_ADDR:-127.0.0.1}:${HENKA_LSP_PUBLISH_PORT:-8182}:8182"
     volumes:
       # Bare token = the named volume below; a path = bind mount.
       # Unset → managed `henka-data` volume (production default). Set
       # HENKA_DATA_DIR=${HOME}/henka to keep state on the host filesystem.
       - "${HENKA_DATA_DIR:-henka-data}:/data"
       - "${HENKA_WORKSPACES_DIR:?set HENKA_WORKSPACES_DIR to a host dir of working copies}:/workspaces:rw"
-    # The image already runs `--transport http --bind 0.0.0.0:8181` by default.
+    # Serve MCP (the image default) and the LSP surface, both bound to every
+    # interface inside the container — the host-side port mappings above decide
+    # external reachability. Drop the `--lsp` args (and the LSP port line) to
+    # serve MCP only.
+    command:
+      ["--transport", "http", "--bind", "0.0.0.0:8181", "--lsp", "--lsp-bind", "0.0.0.0:8182"]
     env_file:
       - path: .env
         required: false
