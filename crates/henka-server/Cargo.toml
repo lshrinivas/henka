@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 henka-core = { workspace = true }
+henka-lsp = { workspace = true }
 henka-lang-java = { workspace = true }
 henka-lang-rust = { workspace = true }
 henka-lang-ts = { workspace = true }

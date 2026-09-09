@@ -406,6 +406,23 @@ impl HenkaMcp {
         }
     }
 
+    /// A snapshot (clone) of a registered project, for a surface that needs to
+    /// hold it across an await without keeping the registry locked.
+    pub(crate) async fn project_snapshot(&self, id: &str) -> Result<Project, CoreError> {
+        let reg = self.registry.read().await;
+        reg.get(id).map(Project::clone)
+    }
+
+    /// The ids of every operation in the catalog, for a surface that advertises
+    /// them (e.g. the LSP `executeCommand` command list).
+    pub(crate) fn command_ids(&self) -> Vec<String> {
+        self.operations
+            .descriptors()
+            .into_iter()
+            .map(|d| d.id)
+            .collect()
+    }
+
     /// Run a catalog operation from MCP call arguments: resolve the project,
     /// look up the operation's descriptor to parse the target and parameters
     /// out of the call envelope, and hand off to the shared

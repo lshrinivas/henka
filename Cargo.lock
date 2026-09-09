@@ -626,6 +626,7 @@ dependencies = [
  "henka-lang-java",
  "henka-lang-rust",
  "henka-lang-ts",
+ "henka-lsp",
  "rmcp",
  "schemars",
  "serde",

@@ -1,5 +1,6 @@
 //! The Henka MCP server binary.
 
+mod lsp;
 mod mcp;
 mod ops;
 mod pathmap;
@@ -98,9 +99,6 @@ async fn main() -> anyhow::Result<()> {
     let lsp = server_config.resolve_lsp(cli.lsp, cli.lsp_bind);
     let server = server_config.resolve_server(cli.transport, cli.bind, &cli.allowed_hosts);
     let path_map = server_config.resolve_path_map(std::env::var("HENKA_PATH_MAP").ok());
-    if lsp.enabled {
-        tracing::info!(bind = %lsp.bind, "LSP surface enabled");
-    }
 
     let config_path = cli.config.unwrap_or_else(default_config_path);
     tracing::info!(config = %config_path.display(), "loading project registry");
@@ -112,6 +110,19 @@ async fn main() -> anyhow::Result<()> {
     // Auto-register projects sitting under the workspace roots, so a client can
     // operate on them without a manual register_project call.
     handler.warm_registry().await;
+
+    // When enabled, serve the LSP surface alongside MCP on its own port. A bind
+    // failure is logged and the surface is skipped — MCP still serves — rather
+    // than taking down the process.
+    if lsp.enabled {
+        let handler = handler.clone();
+        let bind = lsp.bind.clone();
+        tokio::spawn(async move {
+            if let Err(error) = lsp::serve(handler, &bind).await {
+                tracing::error!(%error, "LSP surface failed to start; continuing without it");
+            }
+        });
+    }
 
     match server.transport {
         Transport::Stdio => {
