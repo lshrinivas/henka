@@ -59,15 +59,22 @@ pub struct HenkaMcp {
 }
 
 impl HenkaMcp {
-    /// Build a handler over the given project registry and language providers.
-    /// The operation catalog is assembled from the providers' contributions;
-    /// the path map is taken from `HENKA_PATH_MAP`.
-    pub fn new(registry: ProjectRegistry, providers: ProviderRegistry) -> Self {
+    /// Build a handler over the given project registry, language providers, and
+    /// an already-resolved path map. The operation catalog is assembled from the
+    /// providers' contributions.
+    ///
+    /// The map arrives resolved rather than read from the environment here,
+    /// because it now has more than one source (`HENKA_PATH_MAP` and the server
+    /// configuration file's `[path_map]`); folding those is the binary's job.
+    pub fn with_path_map(
+        registry: ProjectRegistry,
+        providers: ProviderRegistry,
+        path_map: PathMap,
+    ) -> Self {
         let mut operations = OperationRegistry::new();
         operations.extend(providers.operations());
-        let path_map = PathMap::from_env();
         if !path_map.is_empty() {
-            tracing::info!("translating caller paths via HENKA_PATH_MAP");
+            tracing::info!("translating caller paths");
         }
         let auto_register_roots = auto_register_roots(&path_map);
         if !auto_register_roots.is_empty() {
@@ -1432,7 +1439,7 @@ mod tests {
         let mut providers = ProviderRegistry::new();
         providers.register(Arc::new(MockProvider));
 
-        (HenkaMcp::new(registry, providers), root)
+        (HenkaMcp::with_path_map(registry, providers, PathMap::default()), root)
     }
 
     fn args(value: Value) -> Option<JsonObject> {
@@ -1902,7 +1909,7 @@ mod tests {
         providers.register(Arc::new(WhichProvider(Language::Java)));
         providers.register(Arc::new(WhichProvider(Language::TypeScript)));
 
-        (HenkaMcp::new(registry, providers), root)
+        (HenkaMcp::with_path_map(registry, providers, PathMap::default()), root)
     }
 
     /// The `languages` list a `WhichLanguage` result reports.
@@ -1980,7 +1987,7 @@ mod tests {
         }
         let mut registry = ProjectRegistry::load(&cfg).unwrap();
         let root = registry.register(Some("p".into()), &root).unwrap().root.clone();
-        (HenkaMcp::new(registry, providers), root)
+        (HenkaMcp::with_path_map(registry, providers, PathMap::default()), root)
     }
 
     /// The whole result a `SymbolSearchMock` dispatch produced.

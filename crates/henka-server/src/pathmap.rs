@@ -6,7 +6,8 @@
 //! Henka can only resolve its own in-container paths, so `register_project` on a
 //! host path fails and absolute coordinates miss.
 //!
-//! A [`PathMap`], configured via `HENKA_PATH_MAP`, rewrites the prefixes of
+//! A [`PathMap`], configured via `HENKA_PATH_MAP` or the server configuration
+//! file's `[path_map]` section, rewrites the prefixes of
 //! caller-supplied absolute paths so they land on the mounted location. It is
 //! deliberately generic: the mapping is a set of `host=container` prefix pairs,
 //! with no knowledge of any particular mount convention — that belongs to
@@ -23,12 +24,19 @@ pub struct PathMap {
 }
 
 impl PathMap {
-    /// Build a map from the `HENKA_PATH_MAP` environment variable, or an empty
-    /// (identity) map when it is unset.
-    pub fn from_env() -> Self {
-        std::env::var("HENKA_PATH_MAP")
-            .map(|spec| Self::parse(&spec))
-            .unwrap_or_default()
+    /// Build a map from already-separated `host -> container` prefix pairs, as
+    /// the server configuration file's `[path_map]` table supplies them. Pairs
+    /// with an empty side are ignored, matching [`parse`](PathMap::parse).
+    pub fn from_entries<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let entries = entries
+            .into_iter()
+            .filter_map(|(host, container)| {
+                let (host, container) = (host.trim(), container.trim());
+                (!host.is_empty() && !container.is_empty())
+                    .then(|| (PathBuf::from(host), PathBuf::from(container)))
+            })
+            .collect();
+        Self { entries }
     }
 
     /// Parse a `host=container,host=container` specification. Entries without a
@@ -147,6 +155,29 @@ mod tests {
         assert!(PathMap::parse("no-equals-sign, =/c, /h=").is_empty());
         let map = PathMap::parse("");
         assert_eq!(map.map(Path::new("/a/b")), PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn from_entries_matches_a_parsed_spec() {
+        // The configuration file's `[path_map]` table and `HENKA_PATH_MAP` must
+        // produce the same map from the same pairs, so which source an operator
+        // uses cannot change how a path resolves.
+        let from_table = PathMap::from_entries([
+            ("/home/me", "/broad"),
+            ("/home/me/src", "/workspaces"),
+            // An entry with an empty side is dropped, as in a parsed spec.
+            ("", "/ignored"),
+            ("/ignored", ""),
+        ]);
+        let from_spec = PathMap::parse("/home/me=/broad, /home/me/src=/workspaces");
+        for path in ["/home/me/src/proj", "/home/me/docs", "/elsewhere"] {
+            assert_eq!(
+                from_table.map(Path::new(path)),
+                from_spec.map(Path::new(path)),
+                "diverged on {path}"
+            );
+        }
+        assert!(PathMap::from_entries([]).is_empty());
     }
 
     #[test]

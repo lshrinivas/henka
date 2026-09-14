@@ -3,10 +3,11 @@
 mod mcp;
 mod ops;
 mod pathmap;
+mod server_config;
 
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use henka_core::{ProjectRegistry, ProviderRegistry, default_config_path};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -14,35 +15,53 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 
 use crate::mcp::HenkaMcp;
-
-/// How clients connect to the server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Transport {
-    /// Standard input/output, for a single local client.
-    Stdio,
-    /// Streamable HTTP, for a hosted multi-client service.
-    Http,
-}
+use crate::server_config::{ServerConfig, Transport};
 
 /// Multi-tenant MCP server for code refactorings.
+///
+/// Every setting below can also be given in the server configuration file
+/// (`henka.toml`); the command line wins over the environment, which wins over
+/// the file, which wins over the built-in default.
 #[derive(Debug, Parser)]
 #[command(name = "henka", version, about)]
 struct Cli {
-    /// How clients connect.
-    #[arg(long, value_enum, default_value_t = Transport::Stdio)]
-    transport: Transport,
+    /// How clients connect. Defaults to stdio, or `[server] transport` from the
+    /// server configuration file.
+    #[arg(long, value_enum)]
+    transport: Option<Transport>,
 
-    /// Address to bind when `--transport http`. Defaults to loopback; pass
+    /// Address to bind when `--transport http`. Defaults to loopback on 8181,
+    /// or `[server] bind` from the server configuration file; pass
     /// `0.0.0.0:<port>` to listen on all interfaces. The server is
     /// unauthenticated, so binding beyond loopback exposes every registered
     /// project to anyone who can reach the port.
-    #[arg(long, default_value = "127.0.0.1:8181")]
-    bind: String,
+    #[arg(long)]
+    bind: Option<String>,
 
     /// Path to the project registry file. Defaults to
     /// `$XDG_CONFIG_HOME/henka/projects.toml`.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Path to the server configuration file (`henka.toml`), separate from the
+    /// project registry. Defaults to `$HENKA_SERVER_CONFIG`, else
+    /// `$HENKA_DATA/henka.toml`, else `$XDG_CONFIG_HOME/henka/henka.toml`.
+    #[arg(long)]
+    server_config: Option<PathBuf>,
+
+    /// Serve the LSP surface in addition to MCP, on its own port. Can also be
+    /// enabled with `[lsp] enabled = true` in the server configuration file;
+    /// this flag only ever turns it on.
+    #[arg(long)]
+    lsp: bool,
+
+    /// Address to bind the LSP surface to when enabled. Defaults to
+    /// `127.0.0.1:8182`, or `[lsp] bind` from the server configuration file.
+    /// Like the MCP transport, the LSP surface is unauthenticated, so binding
+    /// beyond loopback exposes every registered project to anyone who can reach
+    /// the port.
+    #[arg(long, value_name = "ADDR", env = "HENKA_LSP_BIND")]
+    lsp_bind: Option<String>,
 
     /// Additional `Host` header value to accept on `--transport http`, beyond
     /// the loopback defaults (localhost, 127.0.0.1, ::1). The HTTP transport
@@ -50,7 +69,8 @@ struct Cli {
     /// connects as — e.g. `--allowed-host host.docker.internal` for a client in
     /// a container. A value without a port matches any port. Repeatable, or set
     /// `HENKA_MCP_ALLOWED_HOST` to a space-separated list (handy in a container,
-    /// where the command is the image default).
+    /// where the command is the image default), or list them under
+    /// `[server] allowed_hosts` in the server configuration file.
     #[arg(
         long = "allowed-host",
         value_name = "HOST",
@@ -62,26 +82,43 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
+
+    // Load the server config before anything else — it can supply the log
+    // filter, so tracing cannot be initialized until it is read. An invalid
+    // config therefore fails the process before any project work begins, with
+    // the error surfacing through `main`'s return rather than the log.
+    let server_config_path = cli.server_config.unwrap_or_else(ServerConfig::default_path);
+    let server_config = ServerConfig::load(&server_config_path)?;
+
+    init_tracing(&server_config.resolve_log(std::env::var("HENKA_LOG").ok()));
+
+    // Resolve the surfaces' settings up front (command line over the
+    // environment over the file over the defaults).
+    let lsp = server_config.resolve_lsp(cli.lsp, cli.lsp_bind);
+    let server = server_config.resolve_server(cli.transport, cli.bind, &cli.allowed_hosts);
+    let path_map = server_config.resolve_path_map(std::env::var("HENKA_PATH_MAP").ok());
+    if lsp.enabled {
+        tracing::info!(bind = %lsp.bind, "LSP surface enabled");
+    }
+
     let config_path = cli.config.unwrap_or_else(default_config_path);
     tracing::info!(config = %config_path.display(), "loading project registry");
     let registry = ProjectRegistry::load(&config_path)?;
     tracing::info!(projects = registry.len(), "registry loaded");
 
     let providers = build_providers();
-    let handler = HenkaMcp::new(registry, providers);
+    let handler = HenkaMcp::with_path_map(registry, providers, path_map);
     // Auto-register projects sitting under the workspace roots, so a client can
     // operate on them without a manual register_project call.
     handler.warm_registry().await;
 
-    match cli.transport {
+    match server.transport {
         Transport::Stdio => {
             let service = handler.serve(stdio()).await?;
             service.waiting().await?;
         }
-        Transport::Http => serve_http(handler, &cli.bind, &cli.allowed_hosts).await?,
+        Transport::Http => serve_http(handler, &server.bind, &server.allowed_hosts).await?,
     }
     Ok(())
 }
@@ -155,9 +192,15 @@ fn build_providers() -> ProviderRegistry {
 }
 
 /// Initialize tracing to stderr — stdout is reserved for the MCP stdio channel.
-fn init_tracing() {
+///
+/// `spec` is the already-resolved filter (`HENKA_LOG` over the configuration
+/// file's `[server] log` over the default). An unusable spec falls back to
+/// `info` rather than failing startup, matching how an invalid `HENKA_LOG` has
+/// always behaved; the file's TOML is still validated strictly at load.
+fn init_tracing(spec: &str) {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_env("HENKA_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_new(spec).unwrap_or_else(|_| EnvFilter::new(server_config::DEFAULT_LOG));
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(filter)

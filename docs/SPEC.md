@@ -230,6 +230,12 @@ in what else they offer.
 - The server runs over **stdio** for local/single-client use and over **streamable HTTP** as a
   hosted, multi-client service. The same projects and catalog are available on either.
 - Project registrations persist, so a restarted server restores its tenants.
+- Every server setting can be given on the **command line**, in the **environment**, or in a
+  **server configuration file** (`henka.toml`) — separate from the project registry, so a
+  registration can never disturb it. Where a setting is given more than once, the **command line
+  wins over the environment, which wins over the file, which wins over the built-in default**. A
+  deployment can therefore record its whole startup in one file and run the server with no
+  arguments; a malformed file fails startup rather than silently falling back.
 - **Java support requires** a Java runtime (JDK 25+) and a Java semantic engine available to the
   server; when either is missing, affected projects report their backend as unavailable with a
   clear message instead of failing opaquely.
