@@ -30,7 +30,9 @@ const LANGS: &[(&str, &str)] = &[
 /// Searches, in order: `$HENKA_TYPESCRIPT_LANGUAGE_SERVER`,
 /// `$TYPESCRIPT_LANGUAGE_SERVER`, the bundled
 /// `./.cache/typescript-language-server/node_modules/.bin/...`, the same under
-/// `$XDG_CACHE_HOME`/`~/.cache/henka`, and finally `PATH`.
+/// `$XDG_CACHE_HOME`/`~/.cache/henka`, and finally `PATH`. A candidate that
+/// exists but cannot be executed is skipped, so one broken install early in the
+/// order does not mask a working one later.
 pub fn locate() -> Result<PathBuf> {
     const BIN: &str = "node_modules/.bin/typescript-language-server";
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -45,25 +47,48 @@ pub fn locate() -> Result<PathBuf> {
     candidates.push(PathBuf::from(".cache/typescript-language-server").join(BIN));
     candidates.push(cache_base().join("typescript-language-server").join(BIN));
 
+    // What each candidate turned out to be, for the error if none of them work.
+    let mut looked: Vec<String> = Vec::new();
     for path in &candidates {
-        if path.is_file() {
-            // Absolutize without resolving symlinks — the bundled bin is a
-            // symlink to a Node script, and the session runs the child from the
-            // project root, so a relative path would not resolve.
-            return Ok(std::path::absolute(path).unwrap_or_else(|_| path.clone()));
+        if !path.is_file() {
+            looked.push(path.display().to_string());
+            continue;
         }
+        // Absolutize without resolving symlinks — the bundled bin is a
+        // symlink to a Node script, and the session runs the child from the
+        // project root, so a relative path would not resolve.
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+        if runs(&path) {
+            return Ok(path);
+        }
+        looked.push(format!("{} (found, does not run)", path.display()));
     }
-    if which_on_path("typescript-language-server") {
+    if which_on_path("typescript-language-server") && runs(Path::new("typescript-language-server"))
+    {
         return Ok(PathBuf::from("typescript-language-server"));
     }
+    looked.push("typescript-language-server (PATH)".to_string());
 
-    let looked = candidates
-        .iter()
-        .map(|p| p.display().to_string())
-        .chain(std::iter::once("typescript-language-server (PATH)".to_string()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(TsError::ServerNotFound(looked))
+    Err(TsError::ServerNotFound(looked.join(", ")))
+}
+
+/// Whether `program` can actually be run, as opposed to merely existing: spawn
+/// it with `--version` and wait for a clean exit.
+///
+/// Existence is the wrong test. The bundled server is a Node script behind a
+/// symlink, so it is a present, executable file whether or not the Node it
+/// needs is there, and an install can carry the server without the TypeScript
+/// it drives. Left unprobed, either surfaces only on the first request, as the
+/// language server connection closing for no stated reason. Probing costs one
+/// short-lived child process, once, when the provider is built.
+fn runs(program: &Path) -> bool {
+    std::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Whether `name` resolves to an executable on `PATH`.
@@ -213,4 +238,25 @@ async fn initialize(client: &LspClient, root: &Path) -> Result<()> {
     let _: Value = client.request("initialize", params).await?;
     client.notify("initialized", json!({})).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn runs_rejects_a_file_that_cannot_be_executed() {
+        assert!(runs(Path::new("/usr/bin/true")));
+        assert!(!runs(Path::new("/nonexistent/typescript-language-server")));
+
+        // A present, executable file that still cannot be spawned, which is
+        // what `is_file` alone happily accepts.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("typescript-language-server");
+        std::fs::write(&fake, b"not a runnable script").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!runs(&fake));
+    }
 }

@@ -19,7 +19,9 @@ use crate::error::{Result, RustError};
 ///
 /// Searches, in order: `$HENKA_RUST_ANALYZER`, `$RUST_ANALYZER`, the bundled
 /// `./.cache/rust-analyzer/rust-analyzer`, the same under `$XDG_CACHE_HOME`/
-/// `~/.cache/henka`, and finally `rust-analyzer` on `PATH`.
+/// `~/.cache/henka`, and finally `rust-analyzer` on `PATH`. A candidate that
+/// exists but cannot be executed is skipped, so one stale binary early in the
+/// order does not mask a working one later.
 pub fn locate() -> Result<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     for var in ["HENKA_RUST_ANALYZER", "RUST_ANALYZER"] {
@@ -30,25 +32,47 @@ pub fn locate() -> Result<PathBuf> {
     candidates.push(PathBuf::from(".cache/rust-analyzer/rust-analyzer"));
     candidates.push(cache_base().join("rust-analyzer/rust-analyzer"));
 
+    // What each candidate turned out to be, for the error if none of them work.
+    let mut looked: Vec<String> = Vec::new();
     for path in &candidates {
-        if path.is_file() {
-            // Absolutize: the session sets the child's working directory to the
-            // project root, so a relative program path would not resolve.
-            return Ok(path.canonicalize().unwrap_or_else(|_| path.clone()));
+        if !path.is_file() {
+            looked.push(path.display().to_string());
+            continue;
         }
+        // Absolutize: the session sets the child's working directory to the
+        // project root, so a relative program path would not resolve.
+        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if runs(&path) {
+            return Ok(path);
+        }
+        looked.push(format!("{} (found, does not run)", path.display()));
     }
     // Fall back to PATH lookup by name; the OS resolves it at spawn time.
-    if which_on_path("rust-analyzer") {
+    if which_on_path("rust-analyzer") && runs(Path::new("rust-analyzer")) {
         return Ok(PathBuf::from("rust-analyzer"));
     }
+    looked.push("rust-analyzer (PATH)".to_string());
 
-    let looked = candidates
-        .iter()
-        .map(|p| p.display().to_string())
-        .chain(std::iter::once("rust-analyzer (PATH)".to_string()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(RustError::RustAnalyzerNotFound(looked))
+    Err(RustError::RustAnalyzerNotFound(looked.join(", ")))
+}
+
+/// Whether `program` can actually be run, as opposed to merely existing: spawn
+/// it with `--version` and wait for a clean exit.
+///
+/// Existence is the wrong test. A cache shared with a container holds a binary
+/// for the wrong platform, and a rustup shim for an uninstalled component sits
+/// on `PATH` looking executable; both are present files that die at spawn. Left
+/// unprobed, that surfaces only on the first request, as the language server
+/// connection closing for no stated reason. Probing costs one short-lived child
+/// process, once, when the provider is built.
+fn runs(program: &Path) -> bool {
+    std::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Whether `name` resolves to an executable on `PATH`.
@@ -230,5 +254,27 @@ async fn wait_for_ready(status: &mut broadcast::Receiver<(String, Value)>) {
     .await;
     if waited.is_err() {
         tracing::warn!("timed out waiting for rust-analyzer to become ready; proceeding");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn runs_rejects_a_file_that_cannot_be_executed() {
+        assert!(runs(Path::new("/usr/bin/true")));
+        assert!(!runs(Path::new("/nonexistent/rust-analyzer")));
+
+        // A present, executable file that still cannot be spawned: the shape of
+        // a cached binary built for another platform, which is what `is_file`
+        // alone happily accepts.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("rust-analyzer");
+        std::fs::write(&fake, b"\x7fELF and nothing that runs").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!runs(&fake));
     }
 }
