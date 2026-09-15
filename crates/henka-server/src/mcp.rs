@@ -587,9 +587,21 @@ impl HenkaMcp {
         // holds it until any edit the operation produced has been applied.
         let guard = session.begin_request().await;
         let on_base = session.root() == Some(workspace);
+        // A target's file arrives named under `workspace` (the checkout the
+        // caller opened); the session's index — and the base-rooted paths
+        // `overlay_workspace` just keyed the delta's content under — is rooted
+        // at `session.root()`. Off the base checkout, re-root the target to
+        // match, the query-side mirror of `finish_edit`'s retarget back onto
+        // `workspace` for a result: without it, the operation looks for the
+        // file under the caller's checkout, outside the session's root, and
+        // silently sees nothing there.
+        let mut target = target.clone();
         if !on_base {
             let delta = working_copy_delta(workspace);
             session.overlay_workspace(workspace, &delta).await?;
+            if let Some(root) = session.root() {
+                target.retarget(workspace, root);
+            }
         }
 
         let ctx = OperationCtx {
@@ -597,7 +609,7 @@ impl HenkaMcp {
             session: Arc::clone(&session),
         };
         let req = OperationRequest {
-            target: target.clone(),
+            target,
             params: params.clone(),
         };
         let outcome = operation.run(&ctx, &req).await;

@@ -45,6 +45,12 @@ A *project* is the unit of "a codebase I want to work on." It pins:
 Projects are registered explicitly and persist across server restarts. Registering a project does
 not copy or move its source; the server operates on the tree in place.
 
+A project's root is one **working copy** of its repository — a `jj` workspace or a `git` worktree.
+The same repository can have other working copies checked out as siblings (additional `jj
+workspace`s, or `git worktree`s), each its own directory on disk sharing the project's history.
+Henka treats these siblings as views onto the one project, not as separate projects: they share a
+single index (§9.1) rather than each costing their own.
+
 ### 2.3 Language provider
 
 A *language provider* supplies the semantic understanding for one language and contributes that
@@ -81,8 +87,13 @@ The *target* tells an operation where to act. Depending on the operation it is o
   of);
 - a **selection** — a file plus a range (e.g. the expression to extract);
 - a **file** — a whole file (e.g. organize its imports);
-- the **project** — no specific location (e.g. a workspace-wide symbol search or a structural
+- the **project** — no specific location (e.g. a project-wide symbol search or a structural
   search across the tree).
+
+A target's file is named by a path: relative to the project root unless given as absolute, in
+which case it is resolved as given. Naming a file under a sibling working copy (§9.1) — as an
+absolute path, since a relative one is necessarily read against the root — targets that working
+copy without a separate `workspace` parameter.
 
 ### 2.6 Workspace edit
 
@@ -205,6 +216,48 @@ server therefore tracks each project's version-control state:
 
 This is a performance capability, not a behavioral one: results are identical with or without it,
 but a warm, incrementally-maintained index makes operations on large projects fast.
+
+### 9.1 Sibling working copies
+
+A project's index is built and kept warm against its **root** — one working copy of the
+repository. The same repository can have other working copies checked out alongside it: additional
+`jj workspace`s, or `git worktree`s, each a full directory of the same history at (typically) a
+different revision. Henka does not keep a separate index per working copy; instead, a request that
+targets a sibling **overlays that working copy's uncommitted changes onto the root's shared index**
+for the duration of the request, then discards the overlay. Only the files the sibling actually
+changed are read and re-analyzed — an unchanged file answers from the root's index as-is.
+
+- The **`workspace`** parameter, accepted alongside a target, names which working copy a request
+  acts on by its filesystem path. Omitted, a request acts on the project's root. A target naming a
+  file by an absolute path under a sibling working copy selects that working copy even without an
+  explicit `workspace` (§2.5).
+- A **query** answers as if run directly against the named working copy: coordinates, symbol
+  resolution, and the source text a result quotes all reflect that working copy's on-disk content,
+  not the root's.
+- An **edit** is computed once against the shared index and then **written to the named working
+  copy**, not to the root — the index a sibling overlays is a lens for computing the right answer,
+  never itself a place edits land.
+
+**Worked example.** Project `payments` is registered with root `/repos/payments` (a `jj` repository
+whose working-copy revision is `@`). A second `jj workspace`, sharing the same history, is checked
+out at `/repos/payments.hotfix` with its own, different `@`.
+
+- `find-usages` on `project: "payments"`, `file: "src/Ledger.java"` (no `workspace` given) answers
+  against the root, `/repos/payments`, at its own `@`.
+- `find-usages` on `project: "payments"`, `workspace: "/repos/payments.hotfix"`,
+  `file: "src/Ledger.java"` overlays `/repos/payments.hotfix`'s changes onto the shared index, then
+  answers as of that working copy's `@` — a usage inside a line the hotfix changed reflects the
+  hotfix's version of that line, not the root's.
+- `find-usages` on `project: "payments"`, `file: "/repos/payments.hotfix/src/Ledger.java"` (an
+  absolute path, no `workspace` given) resolves to the same working copy by inference (§2.5) and
+  answers identically to the previous call.
+- `rename` on the same target, applied (not previewed), writes the renamed symbol's occurrences
+  into `/repos/payments.hotfix` — the working copy the request named — leaving `/repos/payments`
+  untouched.
+
+This is what lets several working copies of one project — an editor with one checked out, an
+agent's own working copy, a colleague's worktree for review — share a single warm index rather
+than each paying to build and maintain its own.
 
 ## 10. Languages and extensibility
 

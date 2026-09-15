@@ -151,7 +151,12 @@ impl WorkspaceEdit {
 
 /// Re-root `path` from `from_root` to `to_root` if it lies under `from_root`;
 /// otherwise return it unchanged.
-fn retarget_path(path: &Path, from_root: &Path, to_root: &Path) -> PathBuf {
+///
+/// Shared with [`Target::retarget`](crate::operation::Target::retarget), the
+/// read-side counterpart: this fixes up paths in a result computed against one
+/// checkout so they land on another; that one fixes up an incoming target so it
+/// resolves against the checkout the operation actually runs against.
+pub(crate) fn retarget_path(path: &Path, from_root: &Path, to_root: &Path) -> PathBuf {
     match path.strip_prefix(from_root) {
         Ok(rel) => to_root.join(rel),
         Err(_) => path.to_path_buf(),

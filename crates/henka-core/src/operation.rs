@@ -6,7 +6,7 @@
 //! collected into an [`OperationRegistry`]. They are *not* methods on a fixed
 //! interface: adding an operation is adding a plugin.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -79,6 +79,26 @@ impl Target {
             | Target::File { file } => Some(file),
             Target::Project => None,
         }
+    }
+
+    /// Re-root this target's file from `from_root` to `to_root`, if it lies
+    /// under `from_root`; otherwise leave it unchanged. A no-op for `Project`.
+    ///
+    /// The read-side counterpart to [`WorkspaceEdit::retarget`]: an operation
+    /// runs against a session rooted at `to_root`, but a caller may have named
+    /// the file under a sibling checkout of the same project (`from_root`) —
+    /// e.g. an LSP client whose workspace folder is a secondary jj workspace or
+    /// git worktree, which only ever supplies absolute paths under that
+    /// checkout. Left un-retargeted, the file resolves outside the session's
+    /// root and the operation silently sees nothing there.
+    pub fn retarget(&mut self, from_root: &Path, to_root: &Path) {
+        let file = match self {
+            Target::Position { file, .. }
+            | Target::Selection { file, .. }
+            | Target::File { file } => file,
+            Target::Project => return,
+        };
+        *file = crate::edit::retarget_path(file, from_root, to_root);
     }
 }
 
@@ -269,5 +289,51 @@ impl OperationRegistry {
                     .any(|r| r.descriptor.id == id && r.descriptor.applies_to(l))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retarget_rewrites_position_and_selection_and_file_targets() {
+        let mut target = Target::Position {
+            file: PathBuf::from("/wt/src/A.java"),
+            position: Position::new(1, 2),
+        };
+        target.retarget(Path::new("/wt"), Path::new("/base"));
+        assert_eq!(target.file(), Some(&PathBuf::from("/base/src/A.java")));
+
+        let mut target = Target::Selection {
+            file: PathBuf::from("/wt/src/A.java"),
+            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+        };
+        target.retarget(Path::new("/wt"), Path::new("/base"));
+        assert_eq!(target.file(), Some(&PathBuf::from("/base/src/A.java")));
+
+        let mut target = Target::File {
+            file: PathBuf::from("/wt/src/A.java"),
+        };
+        target.retarget(Path::new("/wt"), Path::new("/base"));
+        assert_eq!(target.file(), Some(&PathBuf::from("/base/src/A.java")));
+    }
+
+    #[test]
+    fn retarget_leaves_foreign_paths_and_project_target_unchanged() {
+        let mut target = Target::Position {
+            file: PathBuf::from("/usr/lib/jvm/src/java/lang/String.java"),
+            position: Position::new(0, 0),
+        };
+        target.retarget(Path::new("/wt"), Path::new("/base"));
+        assert_eq!(
+            target.file(),
+            Some(&PathBuf::from("/usr/lib/jvm/src/java/lang/String.java")),
+            "paths outside the source root are untouched"
+        );
+
+        let mut target = Target::Project;
+        target.retarget(Path::new("/wt"), Path::new("/base"));
+        assert_eq!(target, Target::Project);
     }
 }
